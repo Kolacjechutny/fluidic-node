@@ -13,7 +13,7 @@ and runs periodic synthesis ticks to finalize state and sign BFT certificates.
 docker run -d --name fluidic-node \
   -p 8080:8080 -p 7000:7000 \
   -e OSCILLATOR_ID=node-1 \
-  -e PEERS="testnet-seed.fluidic.foundation:7000" \
+  -e PEERS="136.115.35.170:7000" \
   ghcr.io/kolacjechutny/fluidic-node:latest
 ```
 
@@ -39,7 +39,7 @@ repo, builds the release binary, and starts the node.
 git clone https://github.com/Kolacjechutny/fluidic-node.git
 cd fluidic-node
 cargo build --release --bin mesh_node
-OSCILLATOR_ID=node-1 PEERS="testnet-seed.fluidic.foundation:7000" \
+OSCILLATOR_ID=node-1 PEERS="136.115.35.170:7000" \
   ./target/release/mesh_node
 ```
 
@@ -67,6 +67,10 @@ Use the API at `http://localhost:8080`.
 
 ## Testnet
 
-To join the public testnet, set `PEERS` to a live seed address. The testnet
-exposes its API through `https://api.testnet.fluidic.foundation`, but joining
-as a peer requires a reachable gossip seed on port `7000`.
+To join the public testnet, use the live gossip seed:
+
+```bash
+-e PEERS="136.115.35.170:7000"
+```
+
+The testnet API is also available at `http://api.testnet.fluidic.foundation`.
