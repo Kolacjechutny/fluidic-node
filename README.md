@@ -20,14 +20,14 @@ docker run -d --name fluidic-node \
 Or with Docker Compose:
 
 ```bash
-wget https://raw.githubusercontent.com/Kolacjechutny/fluidic-node/main/docker-compose.yml
+wget https://raw.githubusercontent.com/Fluidic-Foundation/Fluidic-FVM/main/docker-compose.yml
 docker compose up -d
 ```
 
 ### Source installer
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/Kolacjechutny/fluidic-node/main/scripts/run-node.sh | bash
+curl -sSL https://raw.githubusercontent.com/Fluidic-Foundation/Fluidic-FVM/main/scripts/run-node.sh | bash
 ```
 
 The installer tries Docker first; if that fails it installs Rust, clones this
