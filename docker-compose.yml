@@ -1,0 +1,20 @@
+version: "3.8"
+services:
+  fluidic-node:
+    image: ghcr.io/kolacjechutny/fluidic-node:latest
+    container_name: fluidic-node
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "7000:7000"
+    environment:
+      - OSCILLATOR_ID=${OSCILLATOR_ID:-node-1}
+      - API_PORT=8080
+      - BIND_ADDR=0.0.0.0:7000
+      - PEERS=${PEERS:-}
+      - SYNTHESIS_INTERVAL_MS=${SYNTHESIS_INTERVAL_MS:-1000}
+    volumes:
+      - fluidic-data:/root/.local/share/fluidic
+
+volumes:
+  fluidic-data:
