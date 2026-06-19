@@ -14,7 +14,7 @@ docker run -d --name fluidic-node \
   -p 8080:8080 -p 7000:7000 \
   -e OSCILLATOR_ID=node-1 \
   -e PEERS="136.115.35.170:7000" \
-  ghcr.io/kolacjechutny/fluidic-node:latest
+  ghcr.io/Fluidic-Foundation/Fluidic-FVM:latest
 ```
 
 Or with Docker Compose:
@@ -36,7 +36,7 @@ repo, builds the release binary, and starts the node.
 ### Manual build
 
 ```bash
-git clone https://github.com/Kolacjechutny/fluidic-node.git
+git clone https://github.com/Fluidic-Foundation/Fluidic-FVM.git
 cd fluidic-node
 cargo build --release --bin mesh_node
 OSCILLATOR_ID=node-1 PEERS="136.115.35.170:7000" \
