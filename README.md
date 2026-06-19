@@ -12,7 +12,7 @@ and runs periodic synthesis ticks to finalize state and sign BFT certificates.
 ```bash
 docker run -d --name fluidic-node \
   -p 8080:8080 -p 7000:7000 \
-  -e OSCILLATOR_ID=my-node \
+  -e OSCILLATOR_ID=node-1 \
   -e PEERS="testnet-seed.fluidic.foundation:7000" \
   ghcr.io/kolacjechutny/fluidic-node:latest
 ```
@@ -39,7 +39,7 @@ repo, builds the release binary, and starts the node.
 git clone https://github.com/Kolacjechutny/fluidic-node.git
 cd fluidic-node
 cargo build --release --bin mesh_node
-OSCILLATOR_ID=my-node PEERS="testnet-seed.fluidic.foundation:7000" \
+OSCILLATOR_ID=node-1 PEERS="testnet-seed.fluidic.foundation:7000" \
   ./target/release/mesh_node
 ```
 

@@ -14,7 +14,7 @@ IMAGE="ghcr.io/kolacjechutny/fluidic-node:latest"
 
 API_PORT="${API_PORT:-8080}"
 GOSSIP_PORT="${GOSSIP_PORT:-7000}"
-OSCILLATOR_ID="${OSCILLATOR_ID:-$(hostname -s 2>/dev/null || echo "0")}"
+OSCILLATOR_ID="${OSCILLATOR_ID:-node-0}"
 PEERS="${PEERS:-}"
 
 check_docker() {
