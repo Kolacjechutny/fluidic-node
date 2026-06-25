@@ -52,4 +52,4 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh api -X PATCH /user/packages/container/fluidic-node -f visibility=public || true
+          gh api -X PATCH /user/packages/container/fluidic -f visibility=public || true

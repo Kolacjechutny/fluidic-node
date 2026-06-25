@@ -1,4 +1,4 @@
-use fluidic::api::state::ApiState;
+use fluidic::api::state::{ApiState, RecentShift};
 use fluidic::api::start_api_server;
 use fluidic::consensus::Oscillator;
 use fluidic::crypto::keys::KeyPair;
@@ -14,6 +14,16 @@ use tracing::{info, trace, warn};
 
 #[tokio::main]
 async fn main() {
+    eprintln!("mesh_node: starting up");
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("PANIC: {:?}\n", info);
+        eprintln!("{}", msg);
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/data/panic.log")
+            .and_then(|mut f| std::io::Write::write_all(&mut f, msg.as_bytes()));
+    }));
     tracing_subscriber::fmt::init();
 
     let id_str = std::env::var("OSCILLATOR_ID").unwrap_or_else(|_| "0".to_string());
@@ -49,6 +59,16 @@ async fn main() {
         .parse()
         .expect("SYNTHESIS_INTERVAL_MS must be a number");
 
+    let snapshot_interval_ms: u64 = std::env::var("SNAPSHOT_INTERVAL_MS")
+        .unwrap_or_else(|_| "5000".to_string())
+        .parse()
+        .expect("SNAPSHOT_INTERVAL_MS must be a number");
+
+    let generator_interval_ms: u64 = std::env::var("GENERATOR_INTERVAL_MS")
+        .unwrap_or_else(|_| "1000".to_string())
+        .parse()
+        .expect("GENERATOR_INTERVAL_MS must be a number");
+
     info!(
         "starting mesh node id={} bind={} peers={:?}",
         id_str, bind_addr, peers
@@ -75,7 +95,7 @@ async fn main() {
 
     // Seed genesis balance for the local operator on first boot and lock it as
     // stake so a fresh node is immediately eligible to synthesize certificates.
-    let genesis_balance = 1_000_000_000_000_000u128;
+    let genesis_balance = 1_000_000_000_000_000_000u128;
     let local_account = local_keypair.account_id();
     if oscillator
         .wave_field
@@ -97,11 +117,19 @@ async fn main() {
         .unwrap_or_else(|_| "8080".to_string())
         .parse()
         .expect("API_PORT must be a number");
+    // Run the API server on a dedicated OS thread with its own current-thread
+    // Tokio runtime so HTTP handling is isolated from consensus work.
     let api_state_for_server = api_state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = start_api_server(api_state_for_server, api_port).await {
-            tracing::error!("API server failed: {}", e);
-        }
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build API runtime");
+        rt.block_on(async move {
+            if let Err(e) = start_api_server(api_state_for_server, api_port).await {
+                tracing::error!("API server failed: {}", e);
+            }
+        });
     });
 
     let gossip = TcpGossipNode::bind(bind_addr)
@@ -121,13 +149,28 @@ async fn main() {
         0,
         timestamp_ns,
     ));
-    let _ = gossip.outbound.try_send(stake_signal);
+    let _ = gossip.outbound.try_send(stake_signal.clone());
+
+    // Re-announce stake every few seconds so nodes that join later still learn
+    // our operator public key and can verify our synthesis certificates.
+    let announce_outbound = gossip.outbound.clone();
+    tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(5));
+        loop {
+            ticker.tick().await;
+            if let Err(e) = announce_outbound.try_send(stake_signal.clone()) {
+                warn!("stake re-announce send error: {}", e);
+            }
+        }
+    });
 
     // Connect to peers (resolve DNS names like mesh-node-1.mesh-node:7000).
+    let mut peer_addrs: Vec<SocketAddr> = Vec::new();
     for peer in peers {
         match tokio::net::lookup_host(&peer).await {
             Ok(mut addrs) => {
                 if let Some(addr) = addrs.next() {
+                    peer_addrs.push(addr);
                     if let Err(e) = gossip.add_peer(addr).await {
                         warn!("failed to queue peer {}: {}", addr, e);
                     }
@@ -138,6 +181,7 @@ async fn main() {
             Err(e) => warn!("failed to resolve peer {}: {}", peer, e),
         }
     }
+
 
     // Ingest loop: apply incoming phase-shifts to the oscillator.
     let osc_ingest = oscillator.clone();
@@ -163,6 +207,12 @@ async fn main() {
                     osc_ingest.apply_registration(&reg);
                 }
                 Signal::Stake(stake) => {
+                    // Learn the operator's public key from the stake announcement
+                    // so we can verify synthesis certificates from peers that join
+                    // before we do.
+                    if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&stake.public_key) {
+                        api_state_ingest.register_key(stake.operator, vk);
+                    }
                     if !osc_ingest.apply_stake(&stake) {
                         warn!("rejected invalid stake gossip from {}", stake.operator);
                     }
@@ -214,10 +264,14 @@ async fn main() {
     });
 
     // Generator loop: emit periodic commutative phase-shifts.
+    // Apply them locally so the node synthesizes real activity, and broadcast
+    // them so any connected peers see the same load.
     let sender = gossip.outbound.clone();
     let generator_key = local_keypair.clone();
+    let osc_gen = oscillator.clone();
+    let api_gen = api_state.clone();
     tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_millis(100));
+        let mut ticker = interval(Duration::from_millis(generator_interval_ms));
         let mut nonce = 0u64;
         let pool = [0xAB; 32];
         loop {
@@ -231,7 +285,23 @@ async fn main() {
                 nonce,
                 0,
             );
-            if let Err(e) = sender.send(Signal::Commutative(shift)).await {
+            let signal = Signal::Commutative(shift.clone());
+            if let Err(e) = osc_gen.ingest(signal.clone()) {
+                warn!("local generator ingest error: {}", e);
+            } else {
+                let hash = hex::encode(shift.hash());
+                api_gen.record_shift(RecentShift {
+                    hash,
+                    kind: "commutative".to_string(),
+                    status: "accepted".to_string(),
+                    domain: Some(hex::encode(shift.domain)),
+                    from: None,
+                    to: None,
+                    amount: Some(shift.delta.to_string()),
+                    timestamp_ns: shift.timestamp_ns,
+                });
+            }
+            if let Err(e) = sender.send(signal).await {
                 warn!("broadcast error: {}", e);
                 return;
             }
@@ -242,7 +312,7 @@ async fn main() {
     // Periodic snapshot save.
     let osc_save = oscillator.clone();
     tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_secs(30));
+        let mut ticker = interval(Duration::from_millis(snapshot_interval_ms));
         loop {
             ticker.tick().await;
             if let Err(e) = persistence::save(&osc_save, persistence::snapshot_path()) {

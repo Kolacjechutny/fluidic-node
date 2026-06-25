@@ -162,8 +162,8 @@ async fn register_account(
 
     // Faucet: seed both token accounts for the demo.
     let (wave_acc, usdc_acc) = state.token_accounts(account);
-    state.oscillator.seed_account(wave_acc, 10_000_000_000_000); // 10k WAVE
-    state.oscillator.seed_account(usdc_acc, 10_000_000_000_000); // 10k USDC
+    state.oscillator.seed_account(wave_acc, 1_000_000_000_000_000); // 1,000 WAVE
+    state.oscillator.seed_account(usdc_acc, 1_000_000_000_000_000); // 1,000 USDC
 
     // Register derived token accounts so they can sign stateful shifts.
     state.register_key(wave_acc, vk);
@@ -238,23 +238,26 @@ fn parse_u128(s: &str) -> Result<u128, StatusCode> {
     s.parse().map_err(|_| StatusCode::BAD_REQUEST)
 }
 
-fn parse_stateful_shift(req: StatefulShiftRequest) -> Result<StatefulShift, StatusCode> {
-    let from = parse_account(&req.from)?;
-    let to = parse_account(&req.to)?;
-    let amount = parse_u128(&req.amount)?;
-    let signature = hex::decode(&req.signature).map_err(|_| StatusCode::BAD_REQUEST)?;
+fn parse_stateful_shift(req: StatefulShiftRequest) -> Result<StatefulShift, (StatusCode, String)> {
+    let from = parse_account(&req.from).map_err(|e| (e, "invalid from account".to_string()))?;
+    let to = parse_account(&req.to).map_err(|e| (e, "invalid to account".to_string()))?;
+    let amount = parse_u128(&req.amount).map_err(|e| (e, "invalid amount".to_string()))?;
+    let signature = hex::decode(&req.signature)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid signature hex".to_string()))?;
 
-    let clock_map = req.vector_clock.ok_or(StatusCode::BAD_REQUEST)?.entries;
+    let clock_map = req.vector_clock
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing vector_clock".to_string()))?
+        .entries;
     let mut vector_clock = crate::crypto::VectorClock::new();
     for (node_hex, time) in clock_map {
-        let node = parse_hash(&node_hex)?;
+        let node = parse_hash(&node_hex).map_err(|e| (e, "invalid vector_clock node".to_string()))?;
         vector_clock.0.insert(node, time);
     }
 
     let predecessors = req
         .predecessors
         .into_iter()
-        .map(|h| parse_hash(&h))
+        .map(|h| parse_hash(&h).map_err(|e| (e, "invalid predecessor".to_string())))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(StatefulShift {
@@ -274,7 +277,7 @@ fn parse_stateful_shift(req: StatefulShiftRequest) -> Result<StatefulShift, Stat
 async fn submit_stateful(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<StatefulShiftRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let shift = parse_stateful_shift(req)?;
 
     let registry = state.registry.read().unwrap();
@@ -282,16 +285,17 @@ async fn submit_stateful(
         Some(pk) => pk,
         None => {
             tracing::warn!("stateful shift rejected: unknown sender {}", shift.from);
-            return Err(StatusCode::UNAUTHORIZED);
+            return Err((StatusCode::UNAUTHORIZED, "unknown sender".to_string()));
         }
     };
-    let sig = Signature::from_slice(&shift.signature).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let sig = Signature::from_slice(&shift.signature)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid signature bytes".to_string()))?;
     if !KeyPair::verify(pk, &shift.signing_bytes(), &sig) {
         tracing::warn!(
             "stateful shift rejected: invalid signature from {}",
             shift.from
         );
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err((StatusCode::UNAUTHORIZED, "invalid signature".to_string()));
     }
     drop(registry);
 
@@ -304,7 +308,7 @@ async fn submit_stateful(
                 shift.from,
                 e
             );
-            return Err(StatusCode::BAD_REQUEST);
+            return Err((StatusCode::BAD_REQUEST, e));
         }
     }
 
@@ -313,19 +317,20 @@ async fn submit_stateful(
     let is_usdc_to_pool = shift.to == state.pool_usdc_account;
 
     if is_wave_to_pool || is_usdc_to_pool {
-        let main_account = state.main_account(shift.from).ok_or(StatusCode::BAD_REQUEST)?;
+        let main_account = state.main_account(shift.from)
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "derived account not registered".to_string()))?;
         let (wave_user, usdc_user) = state.token_accounts(main_account);
 
         let (payout_from, payout_to, payout_amount) = if is_wave_to_pool {
             let out = state.wave_to_usdc_out(shift.amount);
             if out == 0 {
-                return Err(StatusCode::SERVICE_UNAVAILABLE);
+                return Err((StatusCode::SERVICE_UNAVAILABLE, "swap output is zero".to_string()));
             }
             (state.pool_usdc_account, usdc_user, out)
         } else {
             let out = state.usdc_to_wave_out(shift.amount);
             if out == 0 {
-                return Err(StatusCode::SERVICE_UNAVAILABLE);
+                return Err((StatusCode::SERVICE_UNAVAILABLE, "swap output is zero".to_string()));
             }
             (state.pool_wave_account, wave_user, out)
         };
@@ -338,7 +343,7 @@ async fn submit_stateful(
         state
             .oscillator
             .ingest(Signal::Stateful(payout))
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("payout ingest failed: {}", e)))?;
     }
 
     let user_hash = shift.hash();
@@ -355,7 +360,7 @@ async fn submit_stateful(
     state
         .oscillator
         .ingest(Signal::Stateful(shift))
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("shift ingest failed: {}", e)))?;
 
     Ok(Json(serde_json::json!({
         "status": "queued",

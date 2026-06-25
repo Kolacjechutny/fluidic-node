@@ -90,8 +90,9 @@ pub fn save(osc: &Oscillator, path: impl AsRef<Path>) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
-    let wave = osc.wave_field.lock().map_err(|e| e.to_string())?;
+    // Consistent lock order with the rest of the oscillator: dag first, then wave_field.
     let dag = osc.dag.lock().map_err(|e| e.to_string())?;
+    let wave = osc.wave_field.lock().map_err(|e| e.to_string())?;
 
     let accounts: Vec<_> = wave
         .accounts
@@ -179,8 +180,9 @@ pub fn load(osc: &Oscillator, path: impl AsRef<Path>) -> Result<(), String> {
         return Err(format!("unsupported snapshot version {}", snapshot.version));
     }
 
-    let wave = osc.wave_field.lock().map_err(|e| e.to_string())?;
+    // Consistent lock order with synthesis: dag first, then wave_field.
     let mut dag = osc.dag.lock().map_err(|e| e.to_string())?;
+    let wave = osc.wave_field.lock().map_err(|e| e.to_string())?;
 
     wave.accounts.clear();
     for (hex, state) in snapshot.accounts {

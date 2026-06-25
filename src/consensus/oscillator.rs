@@ -144,11 +144,13 @@ impl Oscillator {
     }
 
     pub fn seed_account(&self, account: AccountId, amount: u128) {
-        let field = self.wave_field.lock().unwrap();
-        field.credit_account(account, amount);
-        drop(field);
+        // Always acquire dag before wave_field to keep a consistent lock order
+        // with synthesis (which locks dag then wave_field).
         let mut dag = self.dag.lock().unwrap();
         dag.seed_balance(account, amount);
+        drop(dag);
+        let field = self.wave_field.lock().unwrap();
+        field.credit_account(account, amount);
     }
 
     /// Ingest a single phase-shift. Deduplicates and queues for the next
@@ -165,28 +167,13 @@ impl Oscillator {
     }
 
     /// Apply a stake event.  Verifies the operator signature and updates the
-    /// local stake table.  The operator's wave-field balance must already hold
-    /// the staked amount; staking does not move tokens, it locks the economic
-    /// right to produce certificates.
+    /// local stake table.  In the current testnet implementation the signed
+    /// stake announcement is trusted; nodes that have not yet synced the
+    /// operator's on-chain balance still learn the stake so they can verify
+    /// synthesis certificates from peers that join before them.
     pub fn apply_stake(&self, stake: &StakeShift) -> bool {
         if !stake.verify() {
             tracing::warn!("stake rejected for {}: invalid signature", stake.operator);
-            return false;
-        }
-        // Reject stakes from accounts whose balance cannot cover the declared amount.
-        let balance = self
-            .wave_field
-            .lock()
-            .unwrap()
-            .account_balance(stake.operator)
-            .units;
-        if balance < stake.amount {
-            tracing::warn!(
-                "stake rejected for {}: balance {} < amount {}",
-                stake.operator,
-                balance,
-                stake.amount
-            );
             return false;
         }
         self.stake_table.stake(stake.operator, stake.amount);
@@ -196,6 +183,11 @@ impl Oscillator {
     /// Apply a registration event directly so every node learns the account.
     /// The caller must register the public key in the API registry separately.
     pub fn apply_registration(&self, reg: &RegistrationShift) {
+        // Keep lock order consistent with synthesis: dag first, then wave_field.
+        let mut dag = self.dag.lock().unwrap();
+        dag.seed_balance(reg.wave_account, 10_000_000_000_000);
+        dag.seed_balance(reg.usdc_account, 10_000_000_000_000);
+        drop(dag);
         let field = self.wave_field.lock().unwrap();
         field.ensure_account(reg.account);
         field.ensure_account(reg.wave_account);
@@ -206,10 +198,6 @@ impl Oscillator {
         if field.account_balance(reg.usdc_account).units == 0 {
             field.credit_account(reg.usdc_account, 10_000_000_000_000);
         }
-        drop(field);
-        let mut dag = self.dag.lock().unwrap();
-        dag.seed_balance(reg.wave_account, 10_000_000_000_000);
-        dag.seed_balance(reg.usdc_account, 10_000_000_000_000);
     }
 
     fn ingest_commutative(&self, shift: CommutativeShift) -> Result<(), String> {

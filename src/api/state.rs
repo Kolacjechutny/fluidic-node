@@ -77,7 +77,9 @@ pub struct ApiState {
 
 impl ApiState {
     pub fn new(oscillator: Arc<Oscillator>) -> Self {
-        let pool_keypair = KeyPair::generate();
+        // Use a deterministic pool keypair across all nodes so every mesh member
+        // shares the same DEX reserves and account roots.
+        let pool_keypair = KeyPair::from_seed(&[0u8; 32]);
         let pool_account = pool_keypair.account_id();
         let pool_wave_account = derive_account(pool_account, b"WAVE");
         let pool_usdc_account = derive_account(pool_account, b"USDC");

@@ -3,19 +3,20 @@ set -euo pipefail
 
 # One-command Fluidic node runner.
 # Usage:
-#   curl -sSL https://raw.githubusercontent.com/Kolacjechutny/fluidic/main/scripts/run-node.sh | bash
+#   curl -sSL https://raw.githubusercontent.com/Fluidic-Foundation/Fluidic-FVM/main/scripts/run-node.sh | bash
 #   PEERS="1.2.3.4:7000,5.6.7.8:7000" ./run-node.sh
 
-REPO="https://github.com/Kolacjechutny/fluidic-node.git"
+REPO="https://github.com/Fluidic-Foundation/Fluidic-FVM.git"
 FLUIDIC_DIR="${FLUIDIC_DIR:-$HOME/.fluidic}"
 SRC_DIR="$FLUIDIC_DIR/src"
 DATA_DIR="$FLUIDIC_DIR/data"
-IMAGE="ghcr.io/kolacjechutny/fluidic-node:latest"
+IMAGE="ghcr.io/Fluidic-Foundation/Fluidic-FVM:latest"
 
 API_PORT="${API_PORT:-8080}"
 GOSSIP_PORT="${GOSSIP_PORT:-7000}"
-OSCILLATOR_ID="${OSCILLATOR_ID:-node-0}"
-PEERS="${PEERS:-}"
+OSCILLATOR_ID="${OSCILLATOR_ID:-$(hostname -s 2>/dev/null || echo "0")}"
+# Default to the Fluidic testnet gossip seed so a one-liner joins the mesh.
+PEERS="${PEERS:-34.56.159.76:7000}"
 
 check_docker() {
   command -v docker >/dev/null 2>&1
@@ -33,7 +34,8 @@ run_docker() {
     -e BIND_ADDR="0.0.0.0:7000" \
     -e PEERS="$PEERS" \
     -e SYNTHESIS_INTERVAL_MS="${SYNTHESIS_INTERVAL_MS:-1000}" \
-    -v "$DATA_DIR:/root/.local/share/fluidic" \
+    -e FLUIDIC_DATA_DIR=/data \
+    -v "$DATA_DIR:/data" \
     "$IMAGE"
 }
 

@@ -1,11 +1,14 @@
 use crate::crypto::Signal;
 use crate::network::node::encode_packet;
 use bytes::{Buf, Bytes, BytesMut};
+use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tokio::time::{interval, Duration};
+use tracing::{error, info, trace, warn};
 
 /// Maximum serialized phase-shift size.
 const MAX_PACKET_SIZE: usize = 64 * 1024;
@@ -41,7 +44,8 @@ impl TcpGossipNode {
     }
 
     /// Request a connection to a peer. The connection is established
-    /// asynchronously by the gossip loop.
+    /// asynchronously by the gossip loop and automatically retried after any
+    /// disconnect.
     pub async fn add_peer(&self, addr: SocketAddr) -> Result<(), String> {
         self.peer_tx
             .send(addr)
@@ -65,6 +69,8 @@ async fn run_gossip(
     mut peer_rx: mpsc::Receiver<SocketAddr>,
 ) {
     let (writer_tx, mut writer_rx) = mpsc::channel::<WriteHalf<TcpStream>>(64);
+    let dial_peers: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
+    let active_peers: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
 
     // Accept inbound connections forever.
     let tx = writer_tx.clone();
@@ -85,26 +91,31 @@ async fn run_gossip(
         }
     });
 
-    // Dial outbound peers requested via add_peer.
+    // Dial outbound peers requested via add_peer and reconnect automatically.
     let tx = writer_tx.clone();
     let inbound = inbound_tx.clone();
+    let dial_peers_task = dial_peers.clone();
+    let active_peers_task = active_peers.clone();
     tokio::spawn(async move {
-        while let Some(peer) = peer_rx.recv().await {
-            let tx = tx.clone();
-            let inbound = inbound.clone();
-            tokio::spawn(async move {
-                match TcpStream::connect(peer).await {
-                    Ok(stream) => {
-                        info!("connected to peer {}", peer);
-                        let (read, write) = tokio::io::split(stream);
-                        let _ = tx.send(write).await;
-                        tokio::spawn(read_loop(read, peer, inbound));
-                    }
-                    Err(e) => {
-                        warn!("failed to connect to peer {}: {}", peer, e);
+        let mut ticker = interval(Duration::from_secs(5));
+        loop {
+            tokio::select! {
+                Some(peer) = peer_rx.recv() => {
+                    dial_peers_task.lock().unwrap().insert(peer);
+                    try_connect(peer, tx.clone(), inbound.clone(), active_peers_task.clone()).await;
+                }
+                _ = ticker.tick() => {
+                    let to_retry: Vec<SocketAddr> = {
+                        let dial = dial_peers_task.lock().unwrap();
+                        let active = active_peers_task.lock().unwrap();
+                        dial.difference(&active).copied().collect()
+                    };
+                    for peer in to_retry {
+                        try_connect(peer, tx.clone(), inbound.clone(), active_peers_task.clone()).await;
                     }
                 }
-            });
+                else => break,
+            }
         }
     });
 
@@ -138,6 +149,37 @@ async fn run_gossip(
                 }
             }
             else => break,
+        }
+    }
+}
+
+async fn try_connect(
+    peer: SocketAddr,
+    writer_tx: mpsc::Sender<WriteHalf<TcpStream>>,
+    inbound_tx: mpsc::Sender<Signal>,
+    active_peers: Arc<Mutex<HashSet<SocketAddr>>>,
+) {
+    {
+        let active = active_peers.lock().unwrap();
+        if active.contains(&peer) {
+            return;
+        }
+    }
+    match TcpStream::connect(peer).await {
+        Ok(stream) => {
+            info!("connected to peer {}", peer);
+            let (read, write) = tokio::io::split(stream);
+            let _ = writer_tx.send(write).await;
+            active_peers.lock().unwrap().insert(peer);
+            let active = active_peers.clone();
+            tokio::spawn(async move {
+                read_loop(read, peer, inbound_tx).await;
+                active.lock().unwrap().remove(&peer);
+                info!("peer {} disconnected, will retry", peer);
+            });
+        }
+        Err(e) => {
+            trace!("failed to connect to peer {}: {}", peer, e);
         }
     }
 }
