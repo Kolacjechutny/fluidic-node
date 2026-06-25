@@ -1,7 +1,10 @@
 use crate::consensus::dag::{DagError, ShiftStatus};
 use crate::consensus::Oscillator;
 use crate::crypto::{AccountId, StatefulShift};
+use crate::evm::EvmTxStatus;
 use crate::field::wave_field::{AccountState, Balance};
+use ethers_core::types::{Address as EvmAddress, H256};
+use revm::InMemoryDB;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,6 +19,12 @@ struct Snapshot {
     dag_nodes: Vec<DagNodeSer>,
     dag_balances: Vec<(String, u128)>,
     total_burned: u128,
+    #[serde(default)]
+    evm_db: Option<InMemoryDB>,
+    #[serde(default)]
+    evm_nonces: Vec<(String, u64)>,
+    #[serde(default)]
+    evm_statuses: Vec<(String, EvmTxStatus)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -147,6 +156,20 @@ pub fn save(osc: &Oscillator, path: impl AsRef<Path>) -> Result<(), String> {
         .lock()
         .map_err(|e| e.to_string())?;
 
+    let evm = osc.evm_pool.lock().map_err(|e| e.to_string())?;
+    let evm_nonces: Vec<_> = evm
+        .nonces
+        .iter()
+        .map(|(addr, nonce)| (format!("0x{}", hex::encode(addr.as_bytes())), *nonce))
+        .collect();
+    let evm_statuses: Vec<_> = evm
+        .statuses
+        .iter()
+        .map(|(hash, status)| (format!("0x{}", hex::encode(hash.as_bytes())), status.clone()))
+        .collect();
+    let evm_db = evm.db.clone();
+    drop(evm);
+
     let snapshot = Snapshot {
         version: 1,
         accounts,
@@ -154,6 +177,9 @@ pub fn save(osc: &Oscillator, path: impl AsRef<Path>) -> Result<(), String> {
         dag_nodes,
         dag_balances,
         total_burned,
+        evm_db: Some(evm_db),
+        evm_nonces,
+        evm_statuses,
     };
 
     let tmp = path.with_extension("tmp");
@@ -260,6 +286,26 @@ pub fn load(osc: &Oscillator, path: impl AsRef<Path>) -> Result<(), String> {
 
     if let Ok(mut burned) = osc.metabolic_engine.total_burned.lock() {
         *burned = snapshot.total_burned;
+    }
+
+    if let Ok(mut evm) = osc.evm_pool.lock() {
+        evm.db = snapshot.evm_db.unwrap_or_default();
+        evm.nonces.clear();
+        for (hex, nonce) in snapshot.evm_nonces {
+            if let Ok(addr) = hex.parse::<EvmAddress>() {
+                evm.nonces.insert(addr, nonce);
+            }
+        }
+        evm.statuses.clear();
+        for (hex, status) in snapshot.evm_statuses {
+            if let Ok(bytes) = hex::decode(hex.trim_start_matches("0x")) {
+                if bytes.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes);
+                    evm.statuses.insert(H256::from(arr), status);
+                }
+            }
+        }
     }
 
     Ok(())

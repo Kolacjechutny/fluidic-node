@@ -8,7 +8,7 @@ use axum::{
     routing::post,
     Router,
 };
-use ethers_core::types::{H256, Address as EvmAddress};
+use ethers_core::types::{H256, U256, Address as EvmAddress};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -112,6 +112,8 @@ async fn dispatch(
         "eth_chainId" => Ok(chain_id().await),
         "net_version" => Ok(chain_id().await),
         "eth_getBalance" => get_balance(state, min_tick, req.params).await,
+        "eth_getCode" => get_code(state, min_tick, req.params).await,
+        "eth_call" => eth_call(state, min_tick, req.params).await,
         "eth_sendRawTransaction" => send_raw_transaction(state, req.params).await,
         "eth_getTransactionReceipt" => get_transaction_receipt(state, min_tick, req.params).await,
         "eth_getTransactionCount" => get_transaction_count(state, min_tick, req.params).await,
@@ -282,6 +284,93 @@ async fn get_transaction_count(
     let addr = EvmAddress::from_slice(&addr_bytes);
     let nonce = state.oscillator.evm_pool.lock().unwrap().nonce(&addr);
     Ok(Value::String(format!("0x{:x}", nonce)))
+}
+
+async fn get_code(
+    state: Arc<ApiState>,
+    min_tick: Option<u64>,
+    params: Vec<Value>,
+) -> Result<Value, (i64, String)> {
+    wait_for_min_tick(&state, min_tick).await;
+    let address = params
+        .first()
+        .and_then(|v| v.as_str())
+        .ok_or((-32602, "missing address".to_string()))?;
+    let addr_bytes = hex::decode(address.trim_start_matches("0x"))
+        .map_err(|e| (-32602, format!("invalid address hex: {}", e)))?;
+    if addr_bytes.len() != 20 {
+        return Err((-32602, "address must be 20 bytes".to_string()));
+    }
+    let addr = EvmAddress::from_slice(&addr_bytes);
+    let pool = state.oscillator.evm_pool.lock().unwrap();
+    let executor = crate::evm::EvmExecutor::with_db(pool.db.clone());
+    let code = executor.code_at(addr).unwrap_or_default();
+    Ok(Value::String(format!("0x{}", hex::encode(code))))
+}
+
+async fn eth_call(
+    state: Arc<ApiState>,
+    min_tick: Option<u64>,
+    params: Vec<Value>,
+) -> Result<Value, (i64, String)> {
+    wait_for_min_tick(&state, min_tick).await;
+    let call = params
+        .first()
+        .and_then(|v| v.as_object())
+        .ok_or((-32602, "missing call object".to_string()))?;
+
+    let from = call
+        .get("from")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<EvmAddress>().ok())
+        .unwrap_or_else(|| EvmAddress::zero());
+    let to = call
+        .get("to")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<EvmAddress>().ok());
+    let data = call
+        .get("data")
+        .and_then(|v| v.as_str())
+        .map(|s| hex::decode(s.trim_start_matches("0x")).unwrap_or_default())
+        .unwrap_or_default();
+    let value = call
+        .get("value")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<U256>().ok())
+        .unwrap_or_default();
+
+    let pool = state.oscillator.evm_pool.lock().unwrap();
+    let mut executor = crate::evm::EvmExecutor::with_db(pool.db.clone());
+
+    // Seed the caller and target with their current Fluidic balances so the
+    // call sees the same state as a committed transaction would.
+    let wave = state.oscillator.wave_field.lock().unwrap();
+    for addr in [Some(from), to].into_iter().flatten() {
+        let fluidic = crate::evm::evm_address_to_fluidic(&addr);
+        let balance = wave.account_balance(fluidic).units;
+        let nonce = pool.nonces.get(&addr).copied().unwrap_or(0);
+        executor.seed_account(addr, balance, nonce);
+    }
+    drop(wave);
+    drop(pool);
+
+    match executor.call(from, to, value, data) {
+        Ok(result) => match result {
+            revm::primitives::ExecutionResult::Success { output, .. } => {
+                let bytes = output.data();
+                Ok(Value::String(format!("0x{}", hex::encode(bytes))))
+            }
+            revm::primitives::ExecutionResult::Revert { output, .. } => Err((
+                -32000,
+                format!("execution reverted: 0x{}", hex::encode(output)),
+            )),
+            revm::primitives::ExecutionResult::Halt { reason, .. } => Err((
+                -32000,
+                format!("execution halted: {:?}", reason),
+            )),
+        },
+        Err(e) => Err((-32000, format!("execution failed: {:?}", e))),
+    }
 }
 
 fn tx_hash_bytes(hash: &H256) -> [u8; 32] {

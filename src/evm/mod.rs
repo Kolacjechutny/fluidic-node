@@ -1,5 +1,6 @@
 use crate::crypto::AccountId;
 use ethers_core::types::{Address as EvmAddress, Transaction, H256, U256};
+use revm::InMemoryDB;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -105,14 +106,20 @@ pub struct EvmPool {
     /// Pending transactions waiting for the next synthesis tick.
     pending: Vec<EvmTransaction>,
     /// Observed transaction statuses keyed by Ethereum tx hash.
-    statuses: HashMap<H256, EvmTxStatus>,
+    pub(crate) statuses: HashMap<H256, EvmTxStatus>,
     /// Last processed nonce per sender EVM address.
-    nonces: BTreeMap<EvmAddress, u64>,
+    pub(crate) nonces: BTreeMap<EvmAddress, u64>,
+    /// Persistent EVM state carried across synthesis ticks. Holds account
+    /// balances, nonces, contract bytecodes, and contract storage.
+    pub db: InMemoryDB,
 }
 
 impl EvmPool {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            db: InMemoryDB::default(),
+            ..Default::default()
+        }
     }
 
     /// Queue a verified transaction for synthesis.
@@ -129,8 +136,9 @@ impl EvmPool {
     }
 
     /// Drain pending transactions, apply them in sender-nonce order using a
-    /// real EVM interpreter, and return the number successfully processed,
-    /// total latency observed (ms), and the hashes of applied transactions.
+    /// real EVM interpreter against the persistent EVM database, and return the
+    /// number successfully processed, total latency observed (ms), and the
+    /// hashes of applied transactions.
     pub fn synthesize(
         &mut self,
         balances: &mut HashMap<AccountId, u128>,
@@ -140,7 +148,8 @@ impl EvmPool {
         self.pending
             .sort_by(|a, b| a.from.cmp(&b.from).then(a.nonce.cmp(&b.nonce)));
 
-        let mut executor = EvmExecutor::new();
+        // Resume from the EVM state left by the previous synthesis tick.
+        let mut executor = EvmExecutor::with_db(self.db.clone());
         executor.prepare(&self.pending, balances, &self.nonces);
 
         let mut applied = 0usize;
@@ -180,6 +189,8 @@ impl EvmPool {
         }
 
         executor.sync_balances_back(balances);
+        // Persist the updated EVM state (balances, nonces, code, storage).
+        self.db = executor.into_db();
         (applied, total_latency_ms, applied_hashes)
     }
 

@@ -35,6 +35,13 @@ impl EvmExecutor {
         }
     }
 
+    pub fn with_db(db: InMemoryDB) -> Self {
+        Self {
+            db,
+            touched: HashSet::new(),
+        }
+    }
+
     /// Seed an EVM account with a balance and nonce before execution.
     pub fn seed_account(&mut self, addr: EvmAddress, balance: u128, nonce: u64) {
         let info = AccountInfo {
@@ -97,6 +104,65 @@ impl EvmExecutor {
 
         evm.transact_commit()
             .map_err(|e| EvmError::Revm(format!("{:?}", e)))
+    }
+
+    /// Consume the executor and return the underlying EVM database so it can be
+    /// persisted across synthesis ticks.
+    pub fn into_db(self) -> InMemoryDB {
+        self.db
+    }
+
+    /// Execute a read-only call against the current EVM state without
+    /// committing changes. Used by `eth_call`.
+    pub fn call(
+        &mut self,
+        caller: EvmAddress,
+        to: Option<EvmAddress>,
+        value: EthersU256,
+        data: Vec<u8>,
+    ) -> Result<revm::primitives::ExecutionResult, EvmError> {
+        self.touched.insert(caller);
+        if let Some(addr) = to {
+            self.touched.insert(addr);
+        }
+
+        let mut evm = Evm::builder()
+            .with_db(&mut self.db)
+            .modify_cfg_env(|cfg| {
+                cfg.chain_id = FLUIDIC_EVM_CHAIN_ID;
+            })
+            .modify_tx_env(|env| {
+                env.caller = to_revm_addr(caller);
+                env.gas_limit = 1_000_000;
+                env.gas_price = RevmU256::ZERO;
+                env.transact_to = match to {
+                    Some(addr) => TxKind::Call(to_revm_addr(addr)),
+                    None => TxKind::Create,
+                };
+                env.value = to_revm_u256(value);
+                env.data = Bytes::copy_from_slice(&data);
+                env.nonce = None;
+            })
+            .build();
+
+        evm.transact()
+            .map(|result| result.result)
+            .map_err(|e| EvmError::Revm(format!("{:?}", e)))
+    }
+
+    /// Return the deployed bytecode at an address, if any.
+    pub fn code_at(&self, addr: EvmAddress) -> Option<Vec<u8>> {
+        let revm_addr = to_revm_addr(addr);
+        let code_hash = self
+            .db
+            .accounts
+            .get(&revm_addr)?
+            .info
+            .code_hash;
+        self.db
+            .contracts
+            .get(&code_hash)
+            .map(|bytecode| bytecode.bytecode().to_vec())
     }
 
     /// Read the current EVM balances of all touched accounts and write them

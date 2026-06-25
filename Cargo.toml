@@ -6,6 +6,14 @@ authors = ["Fluidic Research Prototype"]
 description = "Continuous-wave state engine: NTT aggregation + vector-clock DAG ordering"
 license = "MIT OR Apache-2.0"
 
+[lib]
+name = "fluidic"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fluidic"
+path = "src/main.rs"
+
 [[bin]]
 name = "mesh_node"
 path = "src/bin/mesh_node.rs"
@@ -29,4 +37,14 @@ axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["cors"] }
 hex = "0.4"
 ethers-core = "2"
-revm = "14"
+revm = { version = "14", features = ["serde"] }
+
+[dev-dependencies]
+criterion = "0.5"
+tokio-test = "0.4"
+ethers-signers = "2"
+
+[[bench]]
+name = "metabolic_bench"
+harness = false
+
