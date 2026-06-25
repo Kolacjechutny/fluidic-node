@@ -43,6 +43,27 @@ impl EvmExecutor {
     }
 
     /// Seed an EVM account with a balance and nonce before execution.
+    /// If the account already exists (e.g., a deployed contract), only balance
+    /// and nonce are updated so that code/storage are preserved.
+    pub fn seed_balance_nonce(&mut self, addr: EvmAddress, balance: u128, nonce: u64) {
+        let revm_addr = to_revm_addr(addr);
+        if let Some(account) = self.db.accounts.get_mut(&revm_addr) {
+            account.info.balance = to_revm_u256(balance.into());
+            account.info.nonce = nonce;
+        } else {
+            let info = AccountInfo {
+                balance: to_revm_u256(balance.into()),
+                nonce,
+                code_hash: Default::default(),
+                code: None,
+            };
+            self.db.insert_account_info(revm_addr, info);
+        }
+        self.touched.insert(addr);
+    }
+
+    /// Seed a fresh EVM account. Prefer `seed_balance_nonce` when the address
+    /// may already hold contract code.
     pub fn seed_account(&mut self, addr: EvmAddress, balance: u128, nonce: u64) {
         let info = AccountInfo {
             balance: to_revm_u256(balance.into()),
@@ -67,7 +88,7 @@ impl EvmExecutor {
                 let fluidic = evm_address_to_fluidic(&addr);
                 let balance = balances.get(&fluidic).copied().unwrap_or(0);
                 let nonce = nonces.get(&addr).copied().unwrap_or(0);
-                self.seed_account(addr, balance, nonce);
+                self.seed_balance_nonce(addr, balance, nonce);
             }
         }
     }

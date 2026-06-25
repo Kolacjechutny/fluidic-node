@@ -1,6 +1,7 @@
 use crate::api::state::{ApiState, RecentShift, build_pool_payout_shift};
 use crate::consensus::dag::{DagError, ShiftStatus, VectorClockDag};
 use crate::crypto::{AccountId, CommutativeShift, KeyPair, Signal, StakeShift, StatefulShift};
+use crate::evm::evm_address_to_fluidic;
 use axum::{
     extract::{Path, Query, State, WebSocketUpgrade},
     http::StatusCode,
@@ -30,6 +31,7 @@ pub fn api_router() -> Router<Arc<ApiState>> {
         .route("/api/operator/stake", post(submit_operator_stake))
         .route("/api/operators", get(get_staked_operators))
         .route("/api/operator/:id/rewards", get(get_operator_rewards))
+        .route("/api/evm/faucet", post(evm_faucet))
         .route("/api/ws", get(ws_handler))
 }
 
@@ -187,6 +189,30 @@ async fn register_account(
         "account_id": account.to_string(),
         "wave_account": hex::encode(wave_acc.0),
         "usdc_account": hex::encode(usdc_acc.0),
+    })))
+}
+
+#[derive(Deserialize)]
+struct EvmFaucetRequest {
+    address: String,
+}
+
+async fn evm_faucet(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<EvmFaucetRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let addr_bytes = hex::decode(req.address.trim_start_matches("0x"))
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if addr_bytes.len() != 20 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let addr = ethers_core::types::Address::from_slice(&addr_bytes);
+    let fluidic_account = evm_address_to_fluidic(&addr);
+    state.oscillator.seed_account(fluidic_account, 1_000_000_000_000_000); // 1,000 WAVE
+    Ok(Json(serde_json::json!({
+        "address": req.address,
+        "fluidic_account": fluidic_account.to_string(),
+        "dripped_wave": "1000",
     })))
 }
 
