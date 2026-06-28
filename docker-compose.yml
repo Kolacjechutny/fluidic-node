@@ -1,7 +1,7 @@
 version: "3.8"
 services:
   fluidic-node:
-    image: ghcr.io/Fluidic-Foundation/Fluidic-FVM:latest
+    image: us-central1-docker.pkg.dev/project-934c3e12-e0e7-4811-810/fluidic/mesh-node:latest
     container_name: fluidic-node
     restart: unless-stopped
     ports:

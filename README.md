@@ -24,7 +24,7 @@ docker run -d --name fluidic-node \
   -p 8080:8080 -p 7000:7000 \
   -e OSCILLATOR_ID=my-node \
   -e PEERS="34.56.159.76:7000" \
-  ghcr.io/Fluidic-Foundation/Fluidic-FVM:latest
+  us-central1-docker.pkg.dev/project-934c3e12-e0e7-4811-810/fluidic/mesh-node:latest
 ```
 
 Or with Docker Compose:

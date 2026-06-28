@@ -10,7 +10,7 @@ REPO="https://github.com/Fluidic-Foundation/Fluidic-FVM.git"
 FLUIDIC_DIR="${FLUIDIC_DIR:-$HOME/.fluidic}"
 SRC_DIR="$FLUIDIC_DIR/src"
 DATA_DIR="$FLUIDIC_DIR/data"
-IMAGE="ghcr.io/Fluidic-Foundation/Fluidic-FVM:latest"
+IMAGE="us-central1-docker.pkg.dev/project-934c3e12-e0e7-4811-810/fluidic/mesh-node:latest"
 
 API_PORT="${API_PORT:-8080}"
 GOSSIP_PORT="${GOSSIP_PORT:-7000}"
