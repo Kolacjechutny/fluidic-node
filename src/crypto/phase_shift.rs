@@ -309,6 +309,9 @@ pub enum Signal {
     Pong { timestamp_ns: u64, nonce: u64 },
     /// Signed synthesis certificate gossiped between operators.
     Certificate(crate::consensus::certificate::SynthesisCertificate),
+    /// Gossip authentication handshake. Sent immediately after connecting.
+    /// The proof is a keyed hash proving knowledge of the shared network key.
+    Auth { proof: [u8; 32] },
 }
 
 impl Signal {
@@ -342,6 +345,7 @@ impl Signal {
                 hasher.finalize().into()
             }
             Signal::Certificate(c) => c.hash(),
+            Signal::Auth { proof } => *proof,
         }
     }
 
@@ -353,6 +357,7 @@ impl Signal {
             Signal::Stake(s) => s.timestamp_ns,
             Signal::Ping { timestamp_ns, .. } | Signal::Pong { timestamp_ns, .. } => *timestamp_ns,
             Signal::Certificate(c) => c.timestamp_ns,
+            Signal::Auth { .. } => 0,
         }
     }
 }

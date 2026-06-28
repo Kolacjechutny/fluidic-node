@@ -163,6 +163,7 @@ impl Oscillator {
             Signal::Stake(_) => Err("stake signals must be applied via apply_stake".to_string()),
             Signal::Ping { .. } | Signal::Pong { .. } => Ok(()), // network probes, not state
             Signal::Certificate(_) => Ok(()), // certificates are applied via ingest_certificate
+            Signal::Auth { .. } => Ok(()),     // gossip-layer authentication, not state
         }
     }
 
@@ -393,7 +394,7 @@ impl Oscillator {
         // 3b. Apply verified EVM transactions in nonce order.
         let evm_hashes = {
             let mut evm_pool = self.evm_pool.lock().unwrap();
-            let (evm_applied, evm_latency_ms, hashes) = evm_pool.synthesize(&mut simulated_balances, finalized_at);
+            let (evm_applied, evm_latency_ms, hashes) = evm_pool.synthesize(&mut simulated_balances, finalized_at, tick);
             result.evm_applied = evm_applied;
             finalized_count += evm_applied;
             finalized_latency_ms += evm_latency_ms;

@@ -24,6 +24,8 @@ pub struct DagNode {
     pub finalization_depth: u64,
     /// Wall-clock time when the shift was first observed by this node (ns).
     pub first_seen_at_ns: u64,
+    /// Synthesis tick at which this node was promoted to finalized.
+    pub finalized_at_tick: Option<u64>,
 }
 
 /// Error variants returned by the DAG validator.
@@ -109,6 +111,7 @@ impl VectorClockDag {
             status: ShiftStatus::Accepted,
             finalization_depth,
             first_seen_at_ns,
+            finalized_at_tick: None,
         };
 
         // Update causal bookkeeping.
@@ -166,6 +169,7 @@ impl VectorClockDag {
                 && current_tick.saturating_sub(node.inserted_at_tick) >= node.finalization_depth
             {
                 node.status = ShiftStatus::Finalized;
+                node.finalized_at_tick = Some(current_tick);
                 promoted += 1;
                 if finalized_at_ns > node.first_seen_at_ns {
                     total_latency_ms +=
@@ -182,6 +186,17 @@ impl VectorClockDag {
             return Some(node.status.clone());
         }
         self.rejected.get(hash).cloned().map(ShiftStatus::Rejected)
+    }
+
+    /// Return finalized shifts whose `finalized_at_tick` is at least `from`.
+    pub fn finalized_shifts_since(&self, from: u64) -> Vec<&DagNode> {
+        self.nodes
+            .values()
+            .filter(|n| {
+                n.status == ShiftStatus::Finalized
+                    && n.finalized_at_tick.map(|t| t >= from).unwrap_or(false)
+            })
+            .collect()
     }
 
     /// Return the latest observed vector clock for an account, or an empty clock.

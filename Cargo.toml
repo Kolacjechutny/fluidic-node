@@ -34,7 +34,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bincode = "1"
 rayon = "1"
 axum = { version = "0.7", features = ["ws"] }
-tower-http = { version = "0.5", features = ["cors"] }
+tower = { version = "0.4", features = ["limit"] }
+tower-http = { version = "0.5", features = ["cors", "limit", "timeout"] }
 hex = "0.4"
 ethers-core = "2"
 revm = { version = "14", features = ["serde"] }

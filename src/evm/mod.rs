@@ -1,17 +1,15 @@
 use crate::crypto::AccountId;
-use ethers_core::types::{Address as EvmAddress, Transaction, H256, U256};
+use ethers_core::types::{Address as EvmAddress, H256, U256};
 use revm::InMemoryDB;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod executor;
-
 pub use executor::{EvmError, EvmExecutor};
 
 fn now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
 }
@@ -35,6 +33,31 @@ pub enum EvmTxStatus {
     Failed(String),
 }
 
+/// A single EVM log entry exposed through the RPC interface.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EvmLog {
+    pub address: EvmAddress,
+    pub topics: Vec<H256>,
+    pub data: Vec<u8>,
+}
+
+/// A receipt for an EVM transaction that has been synthesized into a tick.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EvmReceipt {
+    pub transaction_hash: H256,
+    pub transaction_index: u64,
+    pub block_number: u64,
+    pub block_hash: H256,
+    pub from: EvmAddress,
+    pub to: Option<EvmAddress>,
+    pub contract_address: Option<EvmAddress>,
+    pub gas_used: u64,
+    pub cumulative_gas_used: u64,
+    pub effective_gas_price: U256,
+    pub status: u64,
+    pub logs: Vec<EvmLog>,
+}
+
 /// A decoded, verified EVM transaction ready for synthesis.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EvmTransaction {
@@ -43,8 +66,12 @@ pub struct EvmTransaction {
     pub to: Option<EvmAddress>,
     pub value: U256,
     pub gas_price: U256,
+    pub gas_limit: u64,
     pub data: Vec<u8>,
     pub nonce: u64,
+    /// Original signed RLP bytes. Kept so `eth_getTransactionByHash` can return
+    /// the raw transaction.
+    pub raw: Vec<u8>,
     /// Wall-clock time when the raw transaction was first accepted by this node.
     pub first_seen_at_ns: u64,
 }
@@ -52,7 +79,7 @@ pub struct EvmTransaction {
 impl EvmTransaction {
     /// Decode a raw signed Ethereum transaction and recover the sender address.
     pub fn decode_raw(raw: &[u8]) -> Result<Self, String> {
-        let tx: Transaction = ethers_core::utils::rlp::decode(raw)
+        let tx: ethers_core::types::Transaction = ethers_core::utils::rlp::decode(raw)
             .map_err(|e| format!("invalid RLP transaction: {}", e))?;
 
         let chain_id = tx.chain_id.map(|c| c.as_u64()).unwrap_or(0);
@@ -73,8 +100,10 @@ impl EvmTransaction {
             to: tx.to,
             value: tx.value,
             gas_price: tx.gas_price.unwrap_or_default(),
+            gas_limit: if tx.gas.is_zero() { 1_000_000 } else { tx.gas.as_u64() },
             data: tx.input.to_vec(),
             nonce: tx.nonce.as_u64(),
+            raw: raw.to_vec(),
             first_seen_at_ns: 0,
         })
     }
@@ -112,6 +141,10 @@ pub struct EvmPool {
     /// Persistent EVM state carried across synthesis ticks. Holds account
     /// balances, nonces, contract bytecodes, and contract storage.
     pub db: InMemoryDB,
+    /// Finalized receipts keyed by transaction hash.
+    pub(crate) receipts: HashMap<H256, EvmReceipt>,
+    /// Index of transactions keyed by hash (for `eth_getTransactionByHash`).
+    pub(crate) transactions: HashMap<H256, EvmTransaction>,
 }
 
 impl EvmPool {
@@ -131,6 +164,7 @@ impl EvmPool {
             tx.first_seen_at_ns = now_ns();
         }
         self.statuses.insert(tx.hash, EvmTxStatus::Pending);
+        self.transactions.insert(tx.hash, tx.clone());
         self.pending.push(tx);
         Ok(())
     }
@@ -143,19 +177,21 @@ impl EvmPool {
         &mut self,
         balances: &mut HashMap<AccountId, u128>,
         finalized_at_ns: u64,
+        tick: u64,
     ) -> (usize, f64, Vec<H256>) {
         // Sort by (sender, nonce) so each sender's transactions are ordered.
         self.pending
             .sort_by(|a, b| a.from.cmp(&b.from).then(a.nonce.cmp(&b.nonce)));
 
         // Resume from the EVM state left by the previous synthesis tick.
-        let mut executor = EvmExecutor::with_db(self.db.clone());
+        let mut executor = crate::evm::EvmExecutor::with_db(self.db.clone());
         executor.prepare(&self.pending, balances, &self.nonces);
 
         let mut applied = 0usize;
         let mut total_latency_ms = 0.0f64;
         let mut applied_hashes = Vec::new();
-        for tx in self.pending.drain(..) {
+        let mut cumulative_gas = 0u64;
+        for (idx, tx) in self.pending.drain(..).enumerate() {
             let expected = self.nonces.get(&tx.from).copied().unwrap_or(0);
             if tx.nonce != expected {
                 self.statuses.insert(
@@ -165,20 +201,56 @@ impl EvmPool {
                 continue;
             }
 
+            let mut contract_address = None;
+            let mut gas_used = 0u64;
+            let mut status = 0u64;
+            let mut logs = Vec::new();
+
             match executor.execute(&tx) {
                 Ok(result) => {
-                    let success = matches!(result, revm::primitives::ExecutionResult::Success { .. });
-                    if success {
-                        self.nonces.insert(tx.from, expected + 1);
-                        self.statuses.insert(tx.hash, EvmTxStatus::Success);
-                        total_latency_ms += latency_ms(finalized_at_ns, tx.first_seen_at_ns);
-                        applied_hashes.push(tx.hash);
-                        applied += 1;
-                    } else {
-                        self.statuses.insert(
-                            tx.hash,
-                            EvmTxStatus::Failed(format!("evm execution failed: {:?}", result)),
-                        );
+                    gas_used = revm::primitives::ExecutionResult::gas_used(&result);
+                    cumulative_gas += gas_used;
+                    match result {
+                        revm::primitives::ExecutionResult::Success {
+                            output: _,
+                            logs: result_logs,
+                            ..
+                        } => {
+                            logs = result_logs
+                                .into_iter()
+                                .map(|l| EvmLog {
+                                    address: EvmAddress::from_slice(l.address.as_ref()),
+                                    topics: l
+                                        .topics()
+                                        .iter()
+                                        .map(|t| H256::from(t.0))
+                                        .collect(),
+                                    data: l.data.data.to_vec(),
+                                })
+                                .collect();
+                            status = 1;
+                            if tx.to.is_none() {
+                                contract_address = Some(ethers_core::utils::get_contract_address(
+                                    tx.from,
+                                    U256::from(tx.nonce),
+                                ));
+                            }
+                        }
+                        revm::primitives::ExecutionResult::Revert { output, .. } => {
+                            self.statuses.insert(
+                                tx.hash,
+                                EvmTxStatus::Failed(format!(
+                                    "evm execution reverted: 0x{}",
+                                    hex::encode(output)
+                                )),
+                            );
+                        }
+                        revm::primitives::ExecutionResult::Halt { reason, .. } => {
+                            self.statuses.insert(
+                                tx.hash,
+                                EvmTxStatus::Failed(format!("evm execution halted: {:?}", reason)),
+                            );
+                        }
                     }
                 }
                 Err(e) => {
@@ -186,6 +258,33 @@ impl EvmPool {
                         .insert(tx.hash, EvmTxStatus::Failed(format!("{:?}", e)));
                 }
             }
+
+            if status == 1 {
+                self.nonces.insert(tx.from, expected + 1);
+                self.statuses.insert(tx.hash, EvmTxStatus::Success);
+                total_latency_ms += latency_ms(finalized_at_ns, tx.first_seen_at_ns);
+                applied_hashes.push(tx.hash);
+                applied += 1;
+            }
+
+            let block_hash = block_hash_for(tick);
+            self.receipts.insert(
+                tx.hash,
+                EvmReceipt {
+                    transaction_hash: tx.hash,
+                    transaction_index: idx as u64,
+                    block_number: tick,
+                    block_hash,
+                    from: tx.from,
+                    to: tx.to,
+                    contract_address,
+                    gas_used,
+                    cumulative_gas_used: cumulative_gas,
+                    effective_gas_price: tx.gas_price,
+                    status,
+                    logs,
+                },
+            );
         }
 
         executor.sync_balances_back(balances);
@@ -198,10 +297,52 @@ impl EvmPool {
         self.statuses.get(hash).cloned()
     }
 
+    pub fn receipt(&self, hash: &H256) -> Option<&EvmReceipt> {
+        self.receipts.get(hash)
+    }
+
+    pub fn transaction(&self, hash: &H256) -> Option<&EvmTransaction> {
+        self.transactions.get(hash)
+    }
+
+    /// Return all stored logs, optionally filtered by address and/or up to four
+    /// topics.
+    pub fn logs(&self, address: Option<EvmAddress>, topics: &[Option<H256>]) -> Vec<EvmLog> {
+        self.receipts
+            .values()
+            .flat_map(|r| r.logs.clone())
+            .filter(|log| {
+                if let Some(addr) = address {
+                    if log.address != addr {
+                        return false;
+                    }
+                }
+                for (i, topic) in topics.iter().enumerate() {
+                    if let Some(expected) = topic {
+                        if log.topics.get(i) != Some(expected) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .collect()
+    }
+
     /// Return the next valid nonce for an EVM address.
     pub fn nonce(&self, address: &EvmAddress) -> u64 {
         self.nonces.get(address).copied().unwrap_or(0)
     }
+}
+
+/// Deterministic block hash for a synthesis tick.
+pub fn block_hash_for(tick: u64) -> H256 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"fluidic:block:");
+    hasher.update(&tick.to_le_bytes());
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(hasher.finalize().as_bytes());
+    H256::from(arr)
 }
 
 #[cfg(test)]
@@ -260,12 +401,14 @@ mod tests {
         balances.insert(evm_address_to_fluidic(&wallet.address()), 10_000_000_000_000_000_000u128);
 
         pool.submit(decoded).unwrap();
-        let (applied, _, _) = pool.synthesize(&mut balances, now_ns());
+        let (applied, _, _) = pool.synthesize(&mut balances, now_ns(), 1);
         if applied != 1 {
             eprintln!("EVM tx status: {:?}", pool.status(&tx_hash));
         }
         assert_eq!(applied, 1);
         assert_eq!(pool.status(&tx_hash), Some(EvmTxStatus::Success));
+        assert!(pool.receipt(&tx_hash).is_some());
+        assert_eq!(pool.receipt(&tx_hash).unwrap().status, 1);
         assert_eq!(
             balances.get(&evm_address_to_fluidic(&to)).copied().unwrap_or(0),
             1_000_000_000_000_000_000u128

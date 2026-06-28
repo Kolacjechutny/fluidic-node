@@ -1,5 +1,5 @@
 use crate::api::state::{ApiState, RecentShift};
-use crate::evm::{EvmTransaction, FLUIDIC_EVM_CHAIN_ID};
+use crate::evm::{block_hash_for, EvmTransaction, FLUIDIC_EVM_CHAIN_ID};
 use axum::{
     Json,
     extract::{Query, State},
@@ -8,7 +8,7 @@ use axum::{
     routing::post,
     Router,
 };
-use ethers_core::types::{H256, U256, Address as EvmAddress};
+use ethers_core::types::{Address as EvmAddress, H256, U256};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -111,6 +111,7 @@ async fn dispatch(
             Ok(block_number(state).await)
         }
         "eth_getBlockByNumber" => get_block_by_number(state, min_tick, req.params).await,
+        "eth_getBlockByHash" => get_block_by_hash(state, min_tick, req.params).await,
         "eth_chainId" => Ok(chain_id().await),
         "net_version" => Ok(chain_id().await),
         "eth_gasPrice" => Ok(Value::String("0x0".to_string())),
@@ -118,9 +119,11 @@ async fn dispatch(
         "eth_getCode" => get_code(state, min_tick, req.params).await,
         "eth_call" => eth_call(state, min_tick, req.params).await,
         "eth_sendRawTransaction" => send_raw_transaction(state, req.params).await,
+        "eth_getTransactionByHash" => get_transaction_by_hash(state, min_tick, req.params).await,
         "eth_getTransactionReceipt" => get_transaction_receipt(state, min_tick, req.params).await,
         "eth_getTransactionCount" => get_transaction_count(state, min_tick, req.params).await,
         "eth_estimateGas" => estimate_gas(state, min_tick, req.params).await,
+        "eth_getLogs" => get_logs(state, min_tick, req.params).await,
         "web3_clientVersion" => Ok(Value::String("fluidic/0.1.0".to_string())),
         _ => Err((
             -32601,
@@ -135,6 +138,99 @@ async fn block_number(state: Arc<ApiState>) -> Value {
         .synthesis_tick
         .load(std::sync::atomic::Ordering::SeqCst);
     Value::String(format!("0x{:x}", tick))
+}
+
+fn parse_hex_hash(s: &str) -> Result<H256, (i64, String)> {
+    let bytes = hex::decode(s.trim_start_matches("0x"))
+        .map_err(|e| (-32602, format!("invalid hex: {}", e)))?;
+    if bytes.len() != 32 {
+        return Err((-32602, "hash must be 32 bytes".to_string()));
+    }
+    Ok(H256::from_slice(&bytes))
+}
+
+fn parse_hex_address(s: &str) -> Result<EvmAddress, (i64, String)> {
+    let bytes = hex::decode(s.trim_start_matches("0x"))
+        .map_err(|e| (-32602, format!("invalid address hex: {}", e)))?;
+    if bytes.len() != 20 {
+        return Err((-32602, "address must be 20 bytes".to_string()));
+    }
+    Ok(EvmAddress::from_slice(&bytes))
+}
+
+fn h256_to_hex(h: &H256) -> String {
+    format!("0x{}", hex::encode(h.as_bytes()))
+}
+
+fn address_to_hex(a: &EvmAddress) -> String {
+    format!("0x{}", hex::encode(a.as_bytes()))
+}
+
+fn u256_to_hex(u: &U256) -> String {
+    format!("0x{}", u.to_string().trim_start_matches("0x"))
+}
+
+fn block_json(
+    requested: u64,
+    transactions: Vec<H256>,
+    gas_used: u64,
+) -> Value {
+    let hash = block_hash_for(requested);
+    let parent_hash = if requested == 0 {
+        H256::zero()
+    } else {
+        block_hash_for(requested - 1)
+    };
+
+    let empty_hash = "0x0000000000000000000000000000000000000000000000000000000000000000";
+    let empty_addr = "0x0000000000000000000000000000000000000000";
+    let empty_logs = "0x".to_string() + &"0".repeat(512);
+
+    Value::Object(serde_json::Map::from_iter([
+        ("number".to_string(), Value::String(format!("0x{:x}", requested))),
+        ("hash".to_string(), Value::String(h256_to_hex(&hash))),
+        (
+            "parentHash".to_string(),
+            Value::String(h256_to_hex(&parent_hash)),
+        ),
+        ("sha3Uncles".to_string(), Value::String(empty_hash.to_string())),
+        ("miner".to_string(), Value::String(empty_addr.to_string())),
+        ("stateRoot".to_string(), Value::String(empty_hash.to_string())),
+        (
+            "transactionsRoot".to_string(),
+            Value::String(empty_hash.to_string()),
+        ),
+        (
+            "receiptsRoot".to_string(),
+            Value::String(empty_hash.to_string()),
+        ),
+        ("logsBloom".to_string(), Value::String(empty_logs)),
+        ("difficulty".to_string(), Value::String("0x0".to_string())),
+        (
+            "totalDifficulty".to_string(),
+            Value::String("0x0".to_string()),
+        ),
+        ("extraData".to_string(), Value::String("0x".to_string())),
+        ("size".to_string(), Value::String("0x0".to_string())),
+        ("gasLimit".to_string(), Value::String("0x1c9c380".to_string())),
+        ("gasUsed".to_string(), Value::String(format!("0x{:x}", gas_used))),
+        (
+            "timestamp".to_string(),
+            Value::String(format!(
+                "0x{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            )),
+        ),
+        ("mixHash".to_string(), Value::String(empty_hash.to_string())),
+        ("nonce".to_string(), Value::String("0x0000000000000000".to_string())),
+        (
+            "transactions".to_string(),
+            Value::Array(transactions.iter().map(h256_to_hex).map(Value::String).collect()),
+        ),
+    ]))
 }
 
 async fn get_block_by_number(
@@ -162,46 +258,75 @@ async fn get_block_by_number(
         return Ok(Value::Null);
     }
 
-    let hash = {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"fluidic:block:");
-        hasher.update(&requested.to_le_bytes());
-        hasher.finalize()
-    };
-    let parent_hash = if requested == 0 {
-        [0u8; 32]
-    } else {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"fluidic:block:");
-        hasher.update(&(requested - 1).to_le_bytes());
-        *hasher.finalize().as_bytes()
+    let (txs, gas_used) = {
+        let pool = state.oscillator.evm_pool.lock().unwrap();
+        let txs: Vec<H256> = pool
+            .receipts
+            .values()
+            .filter(|r| r.block_number == requested)
+            .map(|r| r.transaction_hash)
+            .collect();
+        let gas_used: u64 = pool
+            .receipts
+            .values()
+            .filter(|r| r.block_number == requested)
+            .map(|r| r.gas_used)
+            .sum();
+        (txs, gas_used)
     };
 
-    let empty_hash = "0x0000000000000000000000000000000000000000000000000000000000000000";
-    let empty_addr = "0x0000000000000000000000000000000000000000";
-    let empty_logs = "0x".to_string() + &"0".repeat(512);
+    Ok(block_json(requested, txs, gas_used))
+}
 
-    Ok(Value::Object(serde_json::Map::from_iter([
-        ("number".to_string(), Value::String(format!("0x{:x}", requested))),
-        ("hash".to_string(), Value::String(format!("0x{}", hex::encode(hash.as_bytes())))),
-        ("parentHash".to_string(), Value::String(format!("0x{}", hex::encode(parent_hash)))),
-        ("sha3Uncles".to_string(), Value::String(empty_hash.to_string())),
-        ("miner".to_string(), Value::String(empty_addr.to_string())),
-        ("stateRoot".to_string(), Value::String(empty_hash.to_string())),
-        ("transactionsRoot".to_string(), Value::String(empty_hash.to_string())),
-        ("receiptsRoot".to_string(), Value::String(empty_hash.to_string())),
-        ("logsBloom".to_string(), Value::String(empty_logs)),
-        ("difficulty".to_string(), Value::String("0x0".to_string())),
-        ("totalDifficulty".to_string(), Value::String("0x0".to_string())),
-        ("extraData".to_string(), Value::String("0x".to_string())),
-        ("size".to_string(), Value::String("0x0".to_string())),
-        ("gasLimit".to_string(), Value::String("0x1c9c380".to_string())),
-        ("gasUsed".to_string(), Value::String("0x0".to_string())),
-        ("timestamp".to_string(), Value::String(format!("0x{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)))),
-        ("mixHash".to_string(), Value::String(empty_hash.to_string())),
-        ("nonce".to_string(), Value::String("0x0000000000000000".to_string())),
-        ("transactions".to_string(), Value::Array(vec![])),
-    ])))
+async fn get_block_by_hash(
+    state: Arc<ApiState>,
+    min_tick: Option<u64>,
+    params: Vec<Value>,
+) -> Result<Value, (i64, String)> {
+    wait_for_min_tick(&state, min_tick).await;
+    let hash_hex = params
+        .first()
+        .and_then(|v| v.as_str())
+        .ok_or((-32602, "missing block hash".to_string()))?;
+    let requested_hash = parse_hex_hash(hash_hex)?;
+
+    let tick = state
+        .oscillator
+        .synthesis_tick
+        .load(std::sync::atomic::Ordering::SeqCst);
+
+    // Block hashes are deterministic from the tick, so walk backwards until we
+    // find a match.
+    let mut requested = None;
+    for n in (0..=tick).rev() {
+        if block_hash_for(n) == requested_hash {
+            requested = Some(n);
+            break;
+        }
+    }
+
+    let Some(requested) = requested else {
+        return Ok(Value::Null);
+    };
+
+    let (txs, gas_used) = {
+        let pool = state.oscillator.evm_pool.lock().unwrap();
+        let txs: Vec<H256> = pool
+            .receipts
+            .values()
+            .filter(|r| r.block_number == requested)
+            .map(|r| r.transaction_hash)
+            .collect();
+        let gas_used: u64 = pool
+            .receipts
+            .values()
+            .filter(|r| r.block_number == requested)
+            .map(|r| r.gas_used)
+            .sum();
+        (txs, gas_used)
+    };
+
+    Ok(block_json(requested, txs, gas_used))
 }
 
 async fn chain_id() -> Value {
@@ -282,6 +407,147 @@ async fn send_raw_transaction(
     Ok(Value::String(hash_hex))
 }
 
+fn transaction_to_json(tx: &EvmTransaction, block_number: Option<u64>) -> Value {
+    let block_hash = block_number.map(block_hash_for).map(|h| h256_to_hex(&h));
+    let mut obj = serde_json::Map::new();
+    obj.insert("hash".to_string(), Value::String(h256_to_hex(&tx.hash)));
+    obj.insert("from".to_string(), Value::String(address_to_hex(&tx.from)));
+    obj.insert(
+        "to".to_string(),
+        tx.to.as_ref().map(address_to_hex).map(Value::String).unwrap_or(Value::Null),
+    );
+    obj.insert("value".to_string(), Value::String(u256_to_hex(&tx.value)));
+    obj.insert("gas".to_string(), Value::String(format!("0x{:x}", tx.gas_limit)));
+    obj.insert(
+        "gasPrice".to_string(),
+        Value::String(u256_to_hex(&tx.gas_price)),
+    );
+    obj.insert("nonce".to_string(), Value::String(format!("0x{:x}", tx.nonce)));
+    obj.insert("input".to_string(), Value::String(format!("0x{}", hex::encode(&tx.data))));
+    obj.insert("v".to_string(), Value::String("0x0".to_string()));
+    obj.insert("r".to_string(), Value::String("0x0".to_string()));
+    obj.insert("s".to_string(), Value::String("0x0".to_string()));
+    obj.insert("chainId".to_string(), Value::String(format!("0x{:x}", FLUIDIC_CHAIN_ID)));
+    obj.insert(
+        "blockNumber".to_string(),
+        block_number
+            .map(|n| Value::String(format!("0x{:x}", n)))
+            .unwrap_or(Value::Null),
+    );
+    obj.insert(
+        "blockHash".to_string(),
+        block_hash.map(Value::String).unwrap_or(Value::Null),
+    );
+    obj.insert("transactionIndex".to_string(), Value::String("0x0".to_string()));
+    Value::Object(obj)
+}
+
+async fn get_transaction_by_hash(
+    state: Arc<ApiState>,
+    min_tick: Option<u64>,
+    params: Vec<Value>,
+) -> Result<Value, (i64, String)> {
+    wait_for_min_tick(&state, min_tick).await;
+    let hash_hex = params
+        .first()
+        .and_then(|v| v.as_str())
+        .ok_or((-32602, "missing transaction hash".to_string()))?;
+    let hash = parse_hex_hash(hash_hex)?;
+
+    let pool = state.oscillator.evm_pool.lock().unwrap();
+    if let Some(tx) = pool.transaction(&hash) {
+        let block_number = pool.receipt(&hash).map(|r| r.block_number);
+        return Ok(transaction_to_json(tx, block_number));
+    }
+    Ok(Value::Null)
+}
+
+fn receipt_to_json(receipt: &crate::evm::EvmReceipt) -> Value {
+    let logs = receipt
+        .logs
+        .iter()
+        .enumerate()
+        .map(|(i, log)| {
+            Value::Object(serde_json::Map::from_iter([
+                ("logIndex".to_string(), Value::String(format!("0x{:x}", i))),
+                (
+                    "transactionIndex".to_string(),
+                    Value::String(format!("0x{:x}", receipt.transaction_index)),
+                ),
+                (
+                    "transactionHash".to_string(),
+                    Value::String(h256_to_hex(&receipt.transaction_hash)),
+                ),
+                (
+                    "blockHash".to_string(),
+                    Value::String(h256_to_hex(&receipt.block_hash)),
+                ),
+                (
+                    "blockNumber".to_string(),
+                    Value::String(format!("0x{:x}", receipt.block_number)),
+                ),
+                ("address".to_string(), Value::String(address_to_hex(&log.address))),
+                (
+                    "topics".to_string(),
+                    Value::Array(log.topics.iter().map(h256_to_hex).map(Value::String).collect()),
+                ),
+                ("data".to_string(), Value::String(format!("0x{}", hex::encode(&log.data)))),
+                ("removed".to_string(), Value::Bool(false)),
+            ]))
+        })
+        .collect();
+
+    Value::Object(serde_json::Map::from_iter([
+        (
+            "transactionHash".to_string(),
+            Value::String(h256_to_hex(&receipt.transaction_hash)),
+        ),
+        (
+            "transactionIndex".to_string(),
+            Value::String(format!("0x{:x}", receipt.transaction_index)),
+        ),
+        (
+            "blockHash".to_string(),
+            Value::String(h256_to_hex(&receipt.block_hash)),
+        ),
+        (
+            "blockNumber".to_string(),
+            Value::String(format!("0x{:x}", receipt.block_number)),
+        ),
+        ("from".to_string(), Value::String(address_to_hex(&receipt.from))),
+        (
+            "to".to_string(),
+            receipt
+                .to
+                .as_ref()
+                .map(address_to_hex)
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        ),
+        (
+            "contractAddress".to_string(),
+            receipt
+                .contract_address
+                .as_ref()
+                .map(address_to_hex)
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        ),
+        (
+            "cumulativeGasUsed".to_string(),
+            Value::String(format!("0x{:x}", receipt.cumulative_gas_used)),
+        ),
+        ("gasUsed".to_string(), Value::String(format!("0x{:x}", receipt.gas_used))),
+        (
+            "effectiveGasPrice".to_string(),
+            Value::String(u256_to_hex(&receipt.effective_gas_price)),
+        ),
+        ("status".to_string(), Value::String(format!("0x{:x}", receipt.status))),
+        ("logs".to_string(), Value::Array(logs)),
+        ("logsBloom".to_string(), Value::String("0x".to_string() + &"0".repeat(512))),
+    ]))
+}
+
 async fn get_transaction_receipt(
     state: Arc<ApiState>,
     min_tick: Option<u64>,
@@ -292,38 +558,14 @@ async fn get_transaction_receipt(
         .first()
         .and_then(|v| v.as_str())
         .ok_or((-32602, "missing transaction hash".to_string()))?;
-    let hash_bytes = hex::decode(hash_hex.trim_start_matches("0x"))
-        .map_err(|e| (-32602, format!("invalid hex: {}", e)))?;
-    if hash_bytes.len() != 32 {
-        return Err((-32602, "hash must be 32 bytes".to_string()));
+    let hash = parse_hex_hash(hash_hex)?;
+
+    let pool = state.oscillator.evm_pool.lock().unwrap();
+    if let Some(receipt) = pool.receipt(&hash) {
+        return Ok(receipt_to_json(receipt));
     }
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&hash_bytes);
-    let hash = H256::from_slice(&hash);
 
-    let status = state
-        .oscillator
-        .evm_pool
-        .lock()
-        .unwrap()
-        .status(&hash);
-
-    match status {
-        Some(crate::evm::EvmTxStatus::Success) => {
-            let tick = state
-                .oscillator
-                .synthesis_tick
-                .load(std::sync::atomic::Ordering::SeqCst);
-            Ok(Value::Object(
-                serde_json::Map::from_iter([
-                    ("transactionHash".to_string(), Value::String(hash_hex.to_string())),
-                    ("status".to_string(), Value::String("0x1".to_string())),
-                    ("blockNumber".to_string(), Value::String(format!("0x{:x}", tick))),
-                    ("gasUsed".to_string(), Value::String("0x0".to_string())),
-                    ("logs".to_string(), Value::Array(vec![])),
-                ]),
-            ))
-        }
+    match pool.status(&hash) {
         Some(crate::evm::EvmTxStatus::Pending) => Ok(Value::Null),
         Some(crate::evm::EvmTxStatus::Failed(reason)) => Ok(Value::Object(
             serde_json::Map::from_iter([
@@ -333,7 +575,7 @@ async fn get_transaction_receipt(
                 ("revertReason".to_string(), Value::String(reason)),
             ]),
         )),
-        None => Ok(Value::Null),
+        _ => Ok(Value::Null),
     }
 }
 
@@ -347,12 +589,7 @@ async fn get_transaction_count(
         .first()
         .and_then(|v| v.as_str())
         .ok_or((-32602, "missing address".to_string()))?;
-    let addr_bytes = hex::decode(address.trim_start_matches("0x"))
-        .map_err(|e| (-32602, format!("invalid address hex: {}", e)))?;
-    if addr_bytes.len() != 20 {
-        return Err((-32602, "address must be 20 bytes".to_string()));
-    }
-    let addr = EvmAddress::from_slice(&addr_bytes);
+    let addr = parse_hex_address(address)?;
     let nonce = state.oscillator.evm_pool.lock().unwrap().nonce(&addr);
     Ok(Value::String(format!("0x{:x}", nonce)))
 }
@@ -367,12 +604,7 @@ async fn get_code(
         .first()
         .and_then(|v| v.as_str())
         .ok_or((-32602, "missing address".to_string()))?;
-    let addr_bytes = hex::decode(address.trim_start_matches("0x"))
-        .map_err(|e| (-32602, format!("invalid address hex: {}", e)))?;
-    if addr_bytes.len() != 20 {
-        return Err((-32602, "address must be 20 bytes".to_string()));
-    }
-    let addr = EvmAddress::from_slice(&addr_bytes);
+    let addr = parse_hex_address(address)?;
     let pool = state.oscillator.evm_pool.lock().unwrap();
     let executor = crate::evm::EvmExecutor::with_db(pool.db.clone());
     let code = executor.code_at(addr).unwrap_or_default();
@@ -489,11 +721,63 @@ async fn estimate_gas(
 
     match executor.call(from, to, value, data) {
         Ok(result) => {
-            let gas = result.gas_used();
+            let gas = revm::primitives::ExecutionResult::gas_used(&result);
             Ok(Value::String(format!("0x{:x}", gas)))
         }
         Err(e) => Err((-32000, format!("execution failed: {:?}", e))),
     }
+}
+
+async fn get_logs(
+    state: Arc<ApiState>,
+    min_tick: Option<u64>,
+    params: Vec<Value>,
+) -> Result<Value, (i64, String)> {
+    wait_for_min_tick(&state, min_tick).await;
+    let filter = params
+        .first()
+        .and_then(|v| v.as_object())
+        .ok_or((-32602, "missing filter object".to_string()))?;
+
+    let address = filter
+        .get("address")
+        .and_then(|v| v.as_str())
+        .map(parse_hex_address)
+        .transpose()?;
+
+    let mut topics = Vec::new();
+    if let Some(arr) = filter.get("topics").and_then(|v| v.as_array()) {
+        for t in arr {
+            if t.is_null() {
+                topics.push(None);
+            } else if let Some(s) = t.as_str() {
+                topics.push(Some(parse_hex_hash(s)?));
+            }
+        }
+    }
+
+    let logs = state
+        .oscillator
+        .evm_pool
+        .lock()
+        .unwrap()
+        .logs(address, &topics);
+
+    let out: Vec<Value> = logs
+        .iter()
+        .map(|log| {
+            Value::Object(serde_json::Map::from_iter([
+                ("address".to_string(), Value::String(address_to_hex(&log.address))),
+                (
+                    "topics".to_string(),
+                    Value::Array(log.topics.iter().map(h256_to_hex).map(Value::String).collect()),
+                ),
+                ("data".to_string(), Value::String(format!("0x{}", hex::encode(&log.data)))),
+            ]))
+        })
+        .collect();
+
+    Ok(Value::Array(out))
 }
 
 fn tx_hash_bytes(hash: &H256) -> [u8; 32] {

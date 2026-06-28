@@ -10,6 +10,9 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
 use tracing::{error, info, trace, warn};
 
+/// Authentication challenge used for the gossip pre-shared-key handshake.
+const AUTH_CHALLENGE: &[u8] = b"fluidic:gossip:auth:v1";
+
 /// Maximum serialized phase-shift size.
 const MAX_PACKET_SIZE: usize = 64 * 1024;
 
@@ -26,14 +29,14 @@ pub struct TcpGossipNode {
 }
 
 impl TcpGossipNode {
-    pub async fn bind(addr: SocketAddr) -> std::io::Result<Self> {
+    pub async fn bind(addr: SocketAddr, psk: Option<[u8; 32]>) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
         let (outbound_tx, outbound_rx) = mpsc::channel(4096);
         let (peer_tx, peer_rx) = mpsc::channel(64);
         let (inbound_tx, inbound_rx) = mpsc::channel(4096);
         let local_addr = listener.local_addr()?;
 
-        tokio::spawn(run_gossip(listener, inbound_tx, outbound_rx, peer_rx));
+        tokio::spawn(run_gossip(listener, inbound_tx, outbound_rx, peer_rx, psk));
 
         Ok(Self {
             local_addr,
@@ -67,22 +70,42 @@ async fn run_gossip(
     inbound_tx: mpsc::Sender<Signal>,
     mut outbound_rx: mpsc::Receiver<Signal>,
     mut peer_rx: mpsc::Receiver<SocketAddr>,
+    psk: Option<[u8; 32]>,
 ) {
     let (writer_tx, mut writer_rx) = mpsc::channel::<WriteHalf<TcpStream>>(64);
     let dial_peers: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
     let active_peers: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
 
+    let auth_proof = psk.map(|key| {
+        let mut hasher = blake3::Hasher::new_keyed(&key);
+        hasher.update(AUTH_CHALLENGE);
+        *hasher.finalize().as_bytes()
+    });
+
     // Accept inbound connections forever.
     let tx = writer_tx.clone();
     let inbound = inbound_tx.clone();
+    let inbound_psk = auth_proof;
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
                     info!("accepted connection from {}", addr);
                     let (read, write) = tokio::io::split(stream);
-                    let _ = tx.send(write).await;
-                    tokio::spawn(read_loop(read, addr, inbound.clone()));
+                    if let Some(proof) = inbound_psk {
+                        // Inbound peers must authenticate before we accept signals.
+                        tokio::spawn(handshake_inbound(
+                            read,
+                            write,
+                            addr,
+                            proof,
+                            tx.clone(),
+                            inbound.clone(),
+                        ));
+                    } else {
+                        let _ = tx.send(write).await;
+                        tokio::spawn(read_loop(read, addr, inbound.clone()));
+                    }
                 }
                 Err(e) => {
                     warn!("accept error: {}", e);
@@ -96,13 +119,14 @@ async fn run_gossip(
     let inbound = inbound_tx.clone();
     let dial_peers_task = dial_peers.clone();
     let active_peers_task = active_peers.clone();
+    let outbound_psk = auth_proof;
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(5));
         loop {
             tokio::select! {
                 Some(peer) = peer_rx.recv() => {
                     dial_peers_task.lock().unwrap().insert(peer);
-                    try_connect(peer, tx.clone(), inbound.clone(), active_peers_task.clone()).await;
+                    try_connect(peer, tx.clone(), inbound.clone(), active_peers_task.clone(), outbound_psk).await;
                 }
                 _ = ticker.tick() => {
                     let to_retry: Vec<SocketAddr> = {
@@ -111,7 +135,7 @@ async fn run_gossip(
                         dial.difference(&active).copied().collect()
                     };
                     for peer in to_retry {
-                        try_connect(peer, tx.clone(), inbound.clone(), active_peers_task.clone()).await;
+                        try_connect(peer, tx.clone(), inbound.clone(), active_peers_task.clone(), outbound_psk).await;
                     }
                 }
                 else => break,
@@ -158,6 +182,7 @@ async fn try_connect(
     writer_tx: mpsc::Sender<WriteHalf<TcpStream>>,
     inbound_tx: mpsc::Sender<Signal>,
     active_peers: Arc<Mutex<HashSet<SocketAddr>>>,
+    auth_proof: Option<[u8; 32]>,
 ) {
     {
         let active = active_peers.lock().unwrap();
@@ -168,7 +193,16 @@ async fn try_connect(
     match TcpStream::connect(peer).await {
         Ok(stream) => {
             info!("connected to peer {}", peer);
-            let (read, write) = tokio::io::split(stream);
+            let (read, mut write) = tokio::io::split(stream);
+
+            // If a PSK is configured, send the authentication proof first.
+            if let Some(proof) = auth_proof {
+                if let Err(e) = send_auth(&mut write, proof).await {
+                    warn!("failed to send auth to {}: {}", peer, e);
+                    return;
+                }
+            }
+
             let _ = writer_tx.send(write).await;
             active_peers.lock().unwrap().insert(peer);
             let active = active_peers.clone();
@@ -182,6 +216,81 @@ async fn try_connect(
             trace!("failed to connect to peer {}: {}", peer, e);
         }
     }
+}
+
+async fn send_auth(writer: &mut WriteHalf<TcpStream>, proof: [u8; 32]) -> std::io::Result<()> {
+    let signal = Signal::Auth { proof };
+    let packet = encode_packet(&signal).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {}", e))
+    })?;
+    writer.write_all(&packet).await?;
+    writer.flush().await
+}
+
+async fn handshake_inbound(
+    mut read: ReadHalf<TcpStream>,
+    write: WriteHalf<TcpStream>,
+    addr: SocketAddr,
+    expected_proof: [u8; 32],
+    writer_tx: mpsc::Sender<WriteHalf<TcpStream>>,
+    inbound_tx: mpsc::Sender<Signal>,
+) {
+    match read_one_signal(&mut read).await {
+        Some(Signal::Auth { proof }) => {
+            if proof != expected_proof {
+                warn!("inbound peer {} failed auth", addr);
+                return;
+            }
+            info!("inbound peer {} authenticated", addr);
+            let _ = writer_tx.send(write).await;
+            read_loop(read, addr, inbound_tx).await;
+        }
+        Some(other) => {
+            warn!(
+                "inbound peer {} sent {} before auth; disconnecting",
+                addr,
+                signal_name(&other)
+            );
+        }
+        None => {
+            trace!("inbound peer {} disconnected during auth", addr);
+        }
+    }
+}
+
+fn signal_name(signal: &Signal) -> &'static str {
+    match signal {
+        Signal::Commutative(_) => "Commutative",
+        Signal::Stateful(_) => "Stateful",
+        Signal::Registration(_) => "Registration",
+        Signal::Stake(_) => "Stake",
+        Signal::Ping { .. } => "Ping",
+        Signal::Pong { .. } => "Pong",
+        Signal::Certificate(_) => "Certificate",
+        Signal::Auth { .. } => "Auth",
+    }
+}
+
+/// Read a single length-prefixed signal from a stream.
+async fn read_one_signal(read: &mut ReadHalf<TcpStream>) -> Option<Signal> {
+    let mut buf = BytesMut::with_capacity(8 * 1024);
+    while buf.len() < 4 {
+        if read.read_buf(&mut buf).await.unwrap_or(0) == 0 {
+            return None;
+        }
+    }
+    let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    buf.advance(4);
+    if len > MAX_PACKET_SIZE {
+        return None;
+    }
+    while buf.len() < len {
+        if read.read_buf(&mut buf).await.unwrap_or(0) == 0 {
+            return None;
+        }
+    }
+    let payload = buf.split_to(len).freeze();
+    bincode::deserialize::<Signal>(&payload).ok()
 }
 
 /// Read length-prefixed phase-shifts from a stream and forward them.

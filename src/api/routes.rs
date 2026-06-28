@@ -1,7 +1,7 @@
 use crate::api::state::{ApiState, RecentShift, build_pool_payout_shift};
 use crate::consensus::dag::{DagError, ShiftStatus, VectorClockDag};
 use crate::crypto::{AccountId, CommutativeShift, KeyPair, Signal, StakeShift, StatefulShift};
-use crate::evm::evm_address_to_fluidic;
+use crate::evm::{block_hash_for, evm_address_to_fluidic};
 use axum::{
     extract::{Path, Query, State, WebSocketUpgrade},
     http::StatusCode,
@@ -32,6 +32,8 @@ pub fn api_router() -> Router<Arc<ApiState>> {
         .route("/api/operators", get(get_staked_operators))
         .route("/api/operator/:id/rewards", get(get_operator_rewards))
         .route("/api/evm/faucet", post(evm_faucet))
+        .route("/api/sync/state", get(get_sync_state))
+        .route("/api/sync/shifts", get(get_sync_shifts))
         .route("/api/ws", get(ws_handler))
 }
 
@@ -744,6 +746,135 @@ async fn get_tick(
         }
         None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "tick not found" }))).into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct SyncShiftsQuery {
+    #[serde(default)]
+    from_tick: u64,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn get_sync_state(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    let current_tick = state
+        .oscillator
+        .synthesis_tick
+        .load(std::sync::atomic::Ordering::SeqCst);
+
+    let balances: std::collections::HashMap<String, String> = {
+        let field = state.oscillator.wave_field.lock().unwrap();
+        field
+            .accounts
+            .iter()
+            .map(|entry| {
+                let acc = *entry.key();
+                let bal = entry.value().balance.units;
+                (hex::encode(acc.0), bal.to_string())
+            })
+            .collect()
+    };
+
+    let registry: std::collections::HashMap<String, String> = {
+        let reg = state.registry.read().unwrap();
+        reg.iter()
+            .map(|(acc, pk)| (hex::encode(acc.0), hex::encode(pk.to_bytes())))
+            .collect()
+    };
+
+    let stake_table = state.oscillator.stake_table.to_snapshot();
+
+    let certificates: Vec<serde_json::Value> = {
+        let certs = state.oscillator.certificates.read().unwrap();
+        certs
+            .iter()
+            .map(|(tick, cert)| {
+                serde_json::json!({
+                    "tick": *tick,
+                    "hash": hex::encode(cert.hash()),
+                    "operator": cert.operator.to_string(),
+                    "commutative_applied": cert.commutative_applied,
+                    "stateful_applied": cert.stateful_applied,
+                    "evm_applied": cert.evm_applied,
+                    "roots": {
+                        "commutative": hex::encode(cert.commutative_root),
+                        "stateful": hex::encode(cert.stateful_root),
+                        "balances": hex::encode(cert.balances_root),
+                        "stake": hex::encode(cert.stake_root),
+                        "reward": hex::encode(cert.reward_root),
+                    },
+                })
+            })
+            .collect()
+    };
+
+    Json(serde_json::json!({
+        "synthesis_tick": current_tick,
+        "block_hash": hex::encode(block_hash_for(current_tick).as_bytes()),
+        "balances": balances,
+        "registry": registry,
+        "stake_table": stake_table,
+        "certificates": certificates,
+    }))
+}
+
+async fn get_sync_shifts(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<SyncShiftsQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(1000).min(10_000);
+
+    let shifts: Vec<serde_json::Value> = {
+        let dag = state.oscillator.dag.lock().unwrap();
+        dag.finalized_shifts_since(query.from_tick)
+            .into_iter()
+            .take(limit)
+            .map(|node| {
+                serde_json::json!({
+                    "hash": hex::encode(node.hash),
+                    "domain": hex::encode(node.shift.domain),
+                    "from": hex::encode(node.shift.from.0),
+                    "to": hex::encode(node.shift.to.0),
+                    "amount": node.shift.amount.to_string(),
+                    "nonce": node.shift.nonce,
+                    "inserted_at_tick": node.inserted_at_tick,
+                    "finalized_at_tick": node.finalized_at_tick,
+                    "timestamp_ns": node.shift.timestamp_ns,
+                    "predecessors": node.shift.predecessors.iter().map(|h| hex::encode(h)).collect::<Vec<_>>(),
+                    "signature": hex::encode(&node.shift.signature),
+                })
+            })
+            .collect()
+    };
+
+    let receipts: Vec<serde_json::Value> = {
+        let pool = state.oscillator.evm_pool.lock().unwrap();
+        pool.receipts
+            .values()
+            .filter(|r| r.block_number >= query.from_tick)
+            .take(limit)
+            .map(|r| {
+                serde_json::json!({
+                    "transactionHash": hex::encode(r.transaction_hash.as_bytes()),
+                    "transactionIndex": r.transaction_index,
+                    "blockNumber": r.block_number,
+                    "blockHash": hex::encode(r.block_hash.as_bytes()),
+                    "from": hex::encode(r.from.as_bytes()),
+                    "to": r.to.map(|a| hex::encode(a.as_bytes())),
+                    "contractAddress": r.contract_address.map(|a| hex::encode(a.as_bytes())),
+                    "gasUsed": r.gas_used,
+                    "cumulativeGasUsed": r.cumulative_gas_used,
+                    "status": r.status,
+                })
+            })
+            .collect()
+    };
+
+    Json(serde_json::json!({
+        "from_tick": query.from_tick,
+        "shifts": shifts,
+        "receipts": receipts,
+    }))
 }
 
 async fn ws_handler(

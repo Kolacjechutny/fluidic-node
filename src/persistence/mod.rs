@@ -3,11 +3,14 @@ use crate::consensus::Oscillator;
 use crate::crypto::{AccountId, StatefulShift};
 use crate::evm::EvmTxStatus;
 use crate::field::wave_field::{AccountState, Balance};
+use crate::operator::stake::{OperatorEntry, StakeTable, StakingConfig};
 use ethers_core::types::{Address as EvmAddress, H256};
 use revm::InMemoryDB;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 
 /// On-disk snapshot of the entire oscillator state.
@@ -25,6 +28,10 @@ struct Snapshot {
     evm_nonces: Vec<(String, u64)>,
     #[serde(default)]
     evm_statuses: Vec<(String, EvmTxStatus)>,
+    #[serde(default)]
+    stake_config: Option<StakingConfig>,
+    #[serde(default)]
+    stake_table: BTreeMap<String, OperatorEntry>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -42,6 +49,8 @@ struct DagNodeSer {
     finalization_depth: u64,
     #[serde(default)]
     first_seen_at_ns: u64,
+    #[serde(default)]
+    finalized_at_tick: Option<u64>,
     status: String,
     error: Option<String>,
 }
@@ -132,6 +141,7 @@ pub fn save(osc: &Oscillator, path: impl AsRef<Path>) -> Result<(), String> {
             inserted_at_tick: node.inserted_at_tick,
             finalization_depth: node.finalization_depth,
             first_seen_at_ns: node.first_seen_at_ns,
+            finalized_at_tick: node.finalized_at_tick,
             status: match node.status {
                 ShiftStatus::Accepted => "accepted".to_string(),
                 ShiftStatus::Finalized => "finalized".to_string(),
@@ -170,6 +180,9 @@ pub fn save(osc: &Oscillator, path: impl AsRef<Path>) -> Result<(), String> {
     let evm_db = evm.db.clone();
     drop(evm);
 
+    let stake_config = Some(osc.stake_table.config().clone());
+    let stake_table = osc.stake_table.to_snapshot();
+
     let snapshot = Snapshot {
         version: 1,
         accounts,
@@ -180,6 +193,8 @@ pub fn save(osc: &Oscillator, path: impl AsRef<Path>) -> Result<(), String> {
         evm_db: Some(evm_db),
         evm_nonces,
         evm_statuses,
+        stake_config,
+        stake_table,
     };
 
     let tmp = path.with_extension("tmp");
@@ -193,7 +208,7 @@ pub fn save(osc: &Oscillator, path: impl AsRef<Path>) -> Result<(), String> {
 }
 
 /// Load oscillator state from `path` into an existing oscillator.
-pub fn load(osc: &Oscillator, path: impl AsRef<Path>) -> Result<(), String> {
+pub fn load(osc: &mut Oscillator, path: impl AsRef<Path>) -> Result<(), String> {
     let path = path.as_ref();
     if !path.exists() {
         return Ok(());
@@ -248,6 +263,7 @@ pub fn load(osc: &Oscillator, path: impl AsRef<Path>) -> Result<(), String> {
                     inserted_at_tick: node.inserted_at_tick,
                     finalization_depth: node.finalization_depth,
                     first_seen_at_ns: node.first_seen_at_ns,
+                    finalized_at_tick: node.finalized_at_tick,
                     status: parse_status(&node.status, &node.error),
                 },
             );
@@ -307,6 +323,11 @@ pub fn load(osc: &Oscillator, path: impl AsRef<Path>) -> Result<(), String> {
             }
         }
     }
+
+    osc.stake_table = Arc::new(StakeTable::from_snapshot(
+        snapshot.stake_config.unwrap_or_default(),
+        snapshot.stake_table,
+    ));
 
     Ok(())
 }

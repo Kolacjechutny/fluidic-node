@@ -80,18 +80,19 @@ async fn main() {
 
     let mut oscillator = Oscillator::new(id, 2048);
     oscillator.set_operator_keypair(local_keypair.clone());
-    let oscillator = Arc::new(oscillator);
-
-    // Membership is dynamic: any node can announce its stake via gossiped
-    // StakeShift messages. No static operator registry is loaded.
 
     // Load persisted state if available, then seed only fresh accounts.
     let snapshot_path = persistence::snapshot_path();
-    if let Err(e) = persistence::load(&oscillator, &snapshot_path) {
+    if let Err(e) = persistence::load(&mut oscillator, &snapshot_path) {
         warn!("failed to load snapshot: {}", e);
     } else {
         info!("loaded snapshot from {:?}", snapshot_path);
     }
+
+    let oscillator = Arc::new(oscillator);
+
+    // Membership is dynamic: any node can announce its stake via gossiped
+    // StakeShift messages. No static operator registry is loaded.
 
     // Seed genesis balance for the local operator on first boot and lock it as
     // stake so a fresh node is immediately eligible to synthesize certificates.
@@ -132,7 +133,22 @@ async fn main() {
         });
     });
 
-    let gossip = TcpGossipNode::bind(bind_addr)
+    let psk: Option<[u8; 32]> = std::env::var("FLUIDIC_PSK")
+        .ok()
+        .and_then(|s| {
+            let bytes = hex::decode(s.trim()).ok()?;
+            if bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                Some(arr)
+            } else {
+                None
+            }
+        });
+    if psk.is_some() {
+        info!("gossip authentication enabled via FLUIDIC_PSK");
+    }
+    let gossip = TcpGossipNode::bind(bind_addr, psk)
         .await
         .expect("failed to bind gossip socket");
     info!("gossip bound to {}", gossip.local_addr);
@@ -235,6 +251,10 @@ async fn main() {
                     } else {
                         trace!("accepted certificate for tick {} from {}", cert.tick, cert.operator);
                     }
+                }
+                Signal::Auth { .. } => {
+                    // Authentication is handled at the gossip layer; once a
+                    // Signal reaches the ingest loop the peer is trusted.
                 }
                 other => {
                     if let Err(e) = osc_ingest.ingest(other) {
