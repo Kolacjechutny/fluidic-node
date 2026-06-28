@@ -8,7 +8,10 @@ services:
       - "8080:8080"
       - "7000:7000"
     environment:
-      - OSCILLATOR_ID=${OSCILLATOR_ID:-node-1}
+      # Set a unique numeric ID in your .env file, e.g. OSCILLATOR_ID=12345.
+      # Reusing the default node-1 across machines causes the operators to slash
+      # each other because they share the same keypair.
+      - OSCILLATOR_ID=${OSCILLATOR_ID}
       - API_PORT=8080
       - BIND_ADDR=0.0.0.0:7000
       - PEERS=${PEERS:-34.56.159.76:7000}

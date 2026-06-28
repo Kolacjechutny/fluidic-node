@@ -21,11 +21,18 @@ A Rust/Tokio reference implementation of the amended Fluidic architecture:
 
 ```bash
 docker run -d --name fluidic-node \
+  --restart unless-stopped \
   -p 8080:8080 -p 7000:7000 \
-  -e OSCILLATOR_ID=my-node \
+  -e OSCILLATOR_ID=12345 \
   -e PEERS="34.56.159.76:7000" \
+  -e FLUIDIC_DATA_DIR=/data \
+  -v "$HOME/fluidic-data:/data" \
   us-central1-docker.pkg.dev/project-934c3e12-e0e7-4811-810/fluidic/mesh-node:latest
 ```
+
+> Use a **unique numeric** `OSCILLATOR_ID` (e.g. `12345`, not `node-1`). The identity is
+deterministic, so two nodes with the same ID share a keypair and will slash each other.
+> Mount `/data` so your snapshot and identity survive container restarts.
 
 Or with Docker Compose:
 
@@ -49,7 +56,7 @@ clones the repo, builds the release binary, and starts the node.
 git clone https://github.com/Fluidic-Foundation/Fluidic-FVM.git
 cd fluidic
 cargo build --release --bin mesh_node
-OSCILLATOR_ID=my-node API_PORT=8080 BIND_ADDR=0.0.0.0:7000 \
+OSCILLATOR_ID=12345 API_PORT=8080 BIND_ADDR=0.0.0.0:7000 \
   PEERS="34.56.159.76:7000" \
   ./target/release/mesh_node
 ```
@@ -58,7 +65,7 @@ OSCILLATOR_ID=my-node API_PORT=8080 BIND_ADDR=0.0.0.0:7000 \
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `OSCILLATOR_ID` | `0` | Unique node identity (number or pod-name suffix) |
+| `OSCILLATOR_ID` | `0` | Unique numeric node identity. Use a random number; do not reuse `node-1` across machines |
 | `API_PORT` | `8080` | HTTP/WebSocket API port |
 | `BIND_ADDR` | `0.0.0.0:7000` | TCP gossip bind address |
 | `PEERS` | `''` | Comma-separated list of gossip peers to dial |

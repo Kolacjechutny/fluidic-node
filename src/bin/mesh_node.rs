@@ -26,17 +26,29 @@ async fn main() {
     }));
     tracing_subscriber::fmt::init();
 
+    let data_dir = std::env::var("FLUIDIC_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
     let id_str = std::env::var("OSCILLATOR_ID").unwrap_or_else(|_| "0".to_string());
     let id = {
         let mut arr = [0u8; 32];
         // Support both plain numbers ("0") and StatefulSet pod names ("mesh-node-0").
+        // If the variable is not a valid number, fall back to a persisted random id
+        // so multiple users running the default instructions do not collide.
         let n: u64 = id_str
             .rsplit_once('-')
             .and_then(|(_, suffix)| suffix.parse().ok())
+            .or_else(|| id_str.parse().ok())
             .unwrap_or_else(|| {
-                id_str
-                    .parse()
-                    .expect("OSCILLATOR_ID must be a number or end with one (e.g. mesh-node-0)")
+                let id_file = std::path::Path::new(&data_dir).join("operator_id");
+                if let Ok(s) = std::fs::read_to_string(&id_file) {
+                    if let Ok(n) = s.trim().parse::<u64>() {
+                        return n;
+                    }
+                }
+                let n: u64 = rand::random();
+                let _ = std::fs::create_dir_all(&data_dir)
+                    .and_then(|_| std::fs::write(&id_file, n.to_string()));
+                info!("generated random OSCILLATOR_ID {}; persisted to {:?}", n, id_file);
+                n
             });
         arr[0..8].copy_from_slice(&n.to_le_bytes());
         arr
@@ -154,7 +166,9 @@ async fn main() {
     info!("gossip bound to {}", gossip.local_addr);
     api_state.set_gossip(gossip.outbound.clone());
 
-    // Announce the local operator's stake to the mesh so peers learn it.
+    // Build the local operator's stake announcement.  We re-announce it
+    // reliably on an interval so peers that connect after we start still learn
+    // our operator public key and can verify our synthesis certificates.
     let timestamp_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -165,17 +179,15 @@ async fn main() {
         0,
         timestamp_ns,
     ));
-    let _ = gossip.outbound.try_send(stake_signal.clone());
 
-    // Re-announce stake every few seconds so nodes that join later still learn
-    // our operator public key and can verify our synthesis certificates.
     let announce_outbound = gossip.outbound.clone();
     tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_secs(5));
+        let mut ticker = interval(Duration::from_secs(3));
         loop {
             ticker.tick().await;
-            if let Err(e) = announce_outbound.try_send(stake_signal.clone()) {
-                warn!("stake re-announce send error: {}", e);
+            match announce_outbound.send(stake_signal.clone()).await {
+                Ok(_) => trace!("re-announced operator stake"),
+                Err(e) => warn!("stake re-announce send error: {}", e),
             }
         }
     });

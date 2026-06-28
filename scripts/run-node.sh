@@ -14,7 +14,18 @@ IMAGE="us-central1-docker.pkg.dev/project-934c3e12-e0e7-4811-810/fluidic/mesh-no
 
 API_PORT="${API_PORT:-8080}"
 GOSSIP_PORT="${GOSSIP_PORT:-7000}"
-OSCILLATOR_ID="${OSCILLATOR_ID:-$(hostname -s 2>/dev/null || echo "0")}"
+# Default to a persisted random numeric ID so repeated runs keep the same
+# identity, and different machines never collide on the default.
+DEFAULT_ID_FILE="$DATA_DIR/.oscillator-id"
+if [ -z "${OSCILLATOR_ID:-}" ]; then
+  if [ -f "$DEFAULT_ID_FILE" ]; then
+    OSCILLATOR_ID="$(cat "$DEFAULT_ID_FILE")"
+  else
+    OSCILLATOR_ID="$(shuf -i 1-4294967295 -n 1)"
+    mkdir -p "$DATA_DIR"
+    echo "$OSCILLATOR_ID" > "$DEFAULT_ID_FILE"
+  fi
+fi
 # Default to the Fluidic testnet gossip seed so a one-liner joins the mesh.
 PEERS="${PEERS:-34.56.159.76:7000}"
 

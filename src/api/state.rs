@@ -120,13 +120,25 @@ impl ApiState {
 
     pub fn broadcast_stake(&self, stake: StakeShift) {
         if let Some(sender) = self.gossip.lock().unwrap().as_ref() {
-            let _ = sender.try_send(Signal::Stake(stake));
+            let sender = sender.clone();
+            let signal = Signal::Stake(stake);
+            tokio::spawn(async move {
+                if let Err(e) = sender.send(signal).await {
+                    tracing::warn!("failed to broadcast stake: {}", e);
+                }
+            });
         }
     }
 
     pub fn broadcast_registration(&self, reg: RegistrationShift) {
         if let Some(sender) = self.gossip.lock().unwrap().as_ref() {
-            let _ = sender.try_send(Signal::Registration(reg));
+            let sender = sender.clone();
+            let signal = Signal::Registration(reg);
+            tokio::spawn(async move {
+                if let Err(e) = sender.send(signal).await {
+                    tracing::warn!("failed to broadcast registration: {}", e);
+                }
+            });
         }
     }
 
