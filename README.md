@@ -167,14 +167,6 @@ Run the node with the API server:
 cargo run --release --bin mesh_node -- --api-port 8080
 ```
 
-Run the dApp:
-
-```bash
-cd dapp
-npm install
-npm run dev
-```
-
 API endpoints:
 
 - `GET  /api/state` — live pool reserves, price, throughput, pool account IDs
@@ -187,11 +179,6 @@ API endpoints:
 A shift becomes **finalized** after surviving `FINALIZATION_DEPTH` synthesis ticks
 without a conflicting double-spend being accepted into the DAG.
 
-End-to-end swap test:
-
-```bash
-node /tmp/test-swap.mjs
-```
 
 ## Key Design Decisions
 
