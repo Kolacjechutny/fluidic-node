@@ -137,17 +137,6 @@ Metabolic decay Criterion benchmark:
 cargo bench --bench metabolic_bench
 ```
 
-## Pitch Deck
-
-Generate the 10-slide investor deck:
-
-```bash
-cd docs
-npm install
-node generate-pdf.js
-```
-
-Output: `docs/fluidic-pitch-deck.pdf`
 
 ## Local Sandboxed Mesh
 
@@ -171,13 +160,6 @@ nodes continued to synthesize the wave-field.
 > **Note:** Docker must be available and the current user must have permission
 > to access the Docker daemon. The partition test was validated syntactically
 > but could not be executed in this environment due to daemon permissions.
-
-## Fluidic DEX dApp
-
-A real React/Vite dApp in `dapp/` connects to the live `mesh_node` API, derives
-Ed25519 accounts in the browser, registers them with a faucet, and signs
-stateful cross-token swaps that are ingested, gossiped, and synthesized by the
-oscillator.
 
 Run the node with the API server:
 
