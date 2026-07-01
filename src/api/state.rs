@@ -54,6 +54,7 @@ pub struct RecentShift {
     pub from: Option<String>,
     pub to: Option<String>,
     pub amount: Option<String>,
+    pub token: Option<String>,
     pub timestamp_ns: u64,
 }
 
@@ -102,6 +103,9 @@ impl ApiState {
         // Seed the DEX pool.
         state.oscillator.seed_account(pool_wave_account, 100_000_000_000_000_000); // 100k WAVE
         state.oscillator.seed_account(pool_usdc_account, 100_000_000_000_000_000); // 100k USDC
+        // The pool's USDC reserve is foreign value and must not decay.  (Its
+        // WAVE reserve decays as WAVE monetary policy.)
+        state.oscillator.mark_non_decaying(pool_usdc_account);
 
         // Register pool accounts so their signed shifts verify in the DAG.
         state.register_key(pool_wave_account, state.pool_keypair.public_key());

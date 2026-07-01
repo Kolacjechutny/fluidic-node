@@ -18,6 +18,8 @@ pub fn api_router() -> Router<Arc<ApiState>> {
         .route("/api/health", get(health))
         .route("/api/state", get(get_state))
         .route("/api/account/:id/balance", get(get_balance))
+        .route("/api/account/:id/shifts", get(get_account_shifts))
+        .route("/api/account/:id", get(get_account_overview))
         .route("/api/account/register", post(register_account))
         .route("/api/shift/commutative", post(submit_commutative))
         .route("/api/shift/stateful", post(submit_stateful))
@@ -31,6 +33,11 @@ pub fn api_router() -> Router<Arc<ApiState>> {
         .route("/api/operator/stake", post(submit_operator_stake))
         .route("/api/operators", get(get_staked_operators))
         .route("/api/operator/:id/rewards", get(get_operator_rewards))
+        .route("/api/rewards/claim", post(claim_operator_rewards))
+        .route("/api/rewards/lp/:pool_id/claim", post(claim_lp_rewards))
+        .route("/api/supply", get(get_supply))
+        .route("/api/domains", get(get_domains))
+        .route("/api/domain/:id", get(get_domain))
         .route("/api/evm/faucet", post(evm_faucet))
         .route("/api/sync/state", get(get_sync_state))
         .route("/api/sync/shifts", get(get_sync_shifts))
@@ -149,6 +156,99 @@ async fn get_balance(
     }))
 }
 
+/// Return the recent shifts that involve a given account (matching either the
+/// main account id or its derived WAVE / USDC token accounts as sender or
+/// recipient).  Backed by the in-memory recent-shift ring buffer.
+async fn get_account_shifts(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Query(query): Query<StateQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    wait_for_min_tick(&state, query.min_tick).await;
+    let user = parse_account(&id)?;
+    let (wave_acc, usdc_acc) = state.token_accounts(user);
+    let keys: [String; 3] = [
+        user.to_string(),
+        wave_acc.to_string(),
+        usdc_acc.to_string(),
+    ];
+    let matches: Vec<RecentShift> = state
+        .recent_shifts
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| {
+            let from = s.from.as_deref().unwrap_or("");
+            let to = s.to.as_deref().unwrap_or("");
+            keys.iter().any(|k| k == from || k == to)
+        })
+        .cloned()
+        .collect();
+    Ok(Json(serde_json::json!({
+        "account": id,
+        "wave_account": wave_acc.to_string(),
+        "usdc_account": usdc_acc.to_string(),
+        "shifts": matches,
+    })))
+}
+
+/// Aggregate wallet view for the explorer: balances, stake, accrued operator
+/// rewards, and the recent shifts touching this account.
+async fn get_account_overview(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Query(query): Query<StateQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    wait_for_min_tick(&state, query.min_tick).await;
+    let user = parse_account(&id)?;
+    let (wave_acc, usdc_acc) = state.token_accounts(user);
+
+    let (wave, usdc) = {
+        let field = state.oscillator.wave_field.lock().unwrap();
+        (
+            field.account_balance(wave_acc).units,
+            field.account_balance(usdc_acc).units,
+        )
+    };
+
+    let stake = state.oscillator.stake_table.get_stake(&user);
+    let is_staked = state.oscillator.stake_table.is_staked(&user);
+    let rewards = state.oscillator.reward_pool.read().unwrap().balance(&user);
+    let registered = state.registry.read().unwrap().contains_key(&user);
+
+    let keys: [String; 3] = [
+        user.to_string(),
+        wave_acc.to_string(),
+        usdc_acc.to_string(),
+    ];
+    let shifts: Vec<RecentShift> = state
+        .recent_shifts
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| {
+            let from = s.from.as_deref().unwrap_or("");
+            let to = s.to.as_deref().unwrap_or("");
+            keys.iter().any(|k| k == from || k == to)
+        })
+        .cloned()
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "account": id,
+        "registered": registered,
+        "wave_account": wave_acc.to_string(),
+        "usdc_account": usdc_acc.to_string(),
+        "wave": wave.to_string(),
+        "usdc": usdc.to_string(),
+        "stake": stake.to_string(),
+        "is_staked": is_staked,
+        "rewards": rewards.to_string(),
+        "shift_count": shifts.len(),
+        "shifts": shifts,
+    })))
+}
+
 #[derive(Deserialize)]
 struct RegisterRequest {
     public_key_hex: String,
@@ -168,6 +268,8 @@ async fn register_account(
     let (wave_acc, usdc_acc) = state.token_accounts(account);
     state.oscillator.seed_account(wave_acc, 1_000_000_000_000_000); // 1,000 WAVE
     state.oscillator.seed_account(usdc_acc, 1_000_000_000_000_000); // 1,000 USDC
+    // USDC is foreign value and is exempt from metabolic decay.
+    state.oscillator.mark_non_decaying(usdc_acc);
 
     // Register derived token accounts so they can sign stateful shifts.
     state.register_key(wave_acc, vk);
@@ -343,6 +445,15 @@ async fn submit_stateful(
     // If the shift targets a pool, create a matching payout.
     let is_wave_to_pool = shift.to == state.pool_wave_account;
     let is_usdc_to_pool = shift.to == state.pool_usdc_account;
+    let _is_pool_payout = shift.from == state.pool_wave_account || shift.from == state.pool_usdc_account;
+
+    let token = if is_wave_to_pool || shift.from == state.pool_wave_account {
+        "WAVE"
+    } else if is_usdc_to_pool || shift.from == state.pool_usdc_account {
+        "USDC"
+    } else {
+        "units"
+    };
 
     if is_wave_to_pool || is_usdc_to_pool {
         let main_account = state.main_account(shift.from)
@@ -383,6 +494,7 @@ async fn submit_stateful(
         from: Some(shift.from.to_string()),
         to: Some(shift.to.to_string()),
         amount: Some(shift.amount.to_string()),
+        token: Some(token.to_string()),
         timestamp_ns: shift.timestamp_ns,
     });
     state
@@ -436,6 +548,7 @@ async fn submit_commutative(
         from: None,
         to: None,
         amount: Some(shift.delta.to_string()),
+        token: Some("units".to_string()),
         timestamp_ns: shift.timestamp_ns,
     });
     state
@@ -498,7 +611,9 @@ async fn submit_operator_stake(
         .unwrap_or(0);
     let stake = StakeShift::sign(&kp, amount, 0, timestamp_ns);
 
-    state.oscillator.apply_stake(&stake);
+    if !state.oscillator.apply_stake(&stake) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     state.broadcast_stake(stake.clone());
 
     Ok(Json(serde_json::json!({
@@ -594,6 +709,188 @@ async fn get_operator_rewards(
         "account": id,
         "rewards": balance.to_string(),
     })))
+}
+
+async fn claim_operator_rewards(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<StateQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    wait_for_min_tick(&state, query.min_tick).await;
+    let kp = state
+        .operator_keypair
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let account = kp.account_id();
+    let claimed = state.oscillator.reward_pool.read().unwrap().claim(&account);
+    if claimed > 0 {
+        state.oscillator.seed_account(account, claimed);
+    }
+    Ok(Json(serde_json::json!({
+        "account": account.to_string(),
+        "claimed": claimed.to_string(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct LpClaimRequest {
+    pool_id: String,
+}
+
+async fn claim_lp_rewards(
+    State(state): State<Arc<ApiState>>,
+    Path(pool_id): Path<String>,
+    Query(query): Query<StateQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    wait_for_min_tick(&state, query.min_tick).await;
+    let bytes = hex::decode(&pool_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if bytes.len() != 32 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    let pool = arr;
+
+    let claimed = state.oscillator.reward_pool.read().unwrap().claim_lp_reward(pool);
+    if claimed > 0 {
+        // LP rewards accrue to the pool reserves as protocol-owned liquidity.
+        // This rewards all LPs implicitly by deepening the pool they share.
+        let half = claimed / 2;
+        state.oscillator.seed_account(state.pool_wave_account, half);
+        state.oscillator.seed_account(state.pool_usdc_account, claimed - half);
+    }
+    Ok(Json(serde_json::json!({
+        "pool_id": pool_id,
+        "claimed": claimed.to_string(),
+    })))
+}
+
+async fn get_supply(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "total": crate::value::supply::TOTAL_WAVE_SUPPLY.to_string(),
+        "circulating": state.oscillator.supply_tracker.circulating().to_string(),
+        "burned": state.oscillator.supply_tracker.burned().to_string(),
+        "remaining": state.oscillator.supply_tracker.remaining().to_string(),
+    }))
+}
+
+/// Best-effort decode of a 32-byte domain id as an ASCII name (trailing zero
+/// padding stripped).  Falls back to the hex id when it is not printable.
+fn domain_display_name(domain: &[u8; 32]) -> String {
+    let trimmed: Vec<u8> = domain.iter().copied().take_while(|b| *b != 0).collect();
+    if !trimmed.is_empty() && trimmed.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
+        String::from_utf8_lossy(&trimmed).to_string()
+    } else {
+        hex::encode(domain)
+    }
+}
+
+fn fee_policy_json(policy: &crate::consensus::domain::FeePolicy) -> serde_json::Value {
+    use crate::consensus::domain::FeePolicy;
+    match policy {
+        FeePolicy::Flat(fee) => serde_json::json!({
+            "type": "flat",
+            "label": "Flat fee",
+            "fee": fee.to_string(),
+        }),
+        FeePolicy::Percentage(bp) => serde_json::json!({
+            "type": "percentage",
+            "label": "Percentage fee",
+            "basis_points": bp,
+            "percent": (*bp as f64) / 100.0,
+        }),
+        FeePolicy::MetabolicOnly => serde_json::json!({
+            "type": "metabolic_only",
+            "label": "Metabolic only",
+        }),
+    }
+}
+
+fn domain_policy_json(
+    policy: &crate::consensus::domain::DomainPolicy,
+    shift_count: usize,
+) -> serde_json::Value {
+    use crate::consensus::domain::OrderingMode;
+    serde_json::json!({
+        "id": hex::encode(policy.domain),
+        "name": domain_display_name(&policy.domain),
+        "commutative": policy.commutative,
+        "stateful": policy.stateful,
+        "ordering": match policy.ordering {
+            OrderingMode::Dag => "dag",
+            OrderingMode::Fifo => "fifo",
+        },
+        "finalization_depth": policy.finalization_depth,
+        "metabolic_lambda_ppm": policy.metabolic_lambda_ppm,
+        "fee_policy": fee_policy_json(&policy.fee_policy),
+        "shift_count": shift_count,
+    })
+}
+
+/// Count recent shifts tagged with a given domain id (hex).
+fn domain_shift_count(state: &ApiState, domain_hex: &str) -> usize {
+    state
+        .recent_shifts
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.domain.as_deref() == Some(domain_hex))
+        .count()
+}
+
+async fn get_domains(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<StateQuery>,
+) -> impl IntoResponse {
+    wait_for_min_tick(&state, query.min_tick).await;
+    let policies = state.oscillator.domain_registry.read().unwrap().all();
+    let domains: Vec<serde_json::Value> = policies
+        .iter()
+        .map(|p| {
+            let count = domain_shift_count(&state, &hex::encode(p.domain));
+            domain_policy_json(p, count)
+        })
+        .collect();
+    Json(serde_json::json!({ "domains": domains }))
+}
+
+async fn get_domain(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Query(query): Query<StateQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    wait_for_min_tick(&state, query.min_tick).await;
+    let domain = parse_domain(&id)?;
+    let policy = state
+        .oscillator
+        .domain_registry
+        .read()
+        .unwrap()
+        .get(&domain)
+        .cloned()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let domain_hex = hex::encode(policy.domain);
+    let count = domain_shift_count(&state, &domain_hex);
+
+    // Include the most recent shifts in this domain for the detail page.
+    let recent: Vec<RecentShift> = state
+        .recent_shifts
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.domain.as_deref() == Some(domain_hex.as_str()))
+        .take(25)
+        .cloned()
+        .collect();
+
+    let mut body = domain_policy_json(&policy, count);
+    if let serde_json::Value::Object(ref mut map) = body {
+        map.insert("recent_shifts".to_string(), serde_json::json!(recent));
+    }
+    Ok(Json(body))
 }
 
 async fn get_recent_shifts(

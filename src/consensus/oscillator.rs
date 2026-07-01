@@ -13,6 +13,7 @@ use crate::field::coordinates::Coordinate;
 use crate::field::wave_field::WaveField;
 use crate::operator::{RewardPool, StakeTable, StakingConfig};
 use crate::value::metabolic::MetabolicDecayEngine;
+use crate::value::SupplyTracker;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -75,6 +76,8 @@ pub struct Oscillator {
     pub reward_pool: Arc<RwLock<RewardPool>>,
     /// EVM transaction pool.
     pub evm_pool: Arc<Mutex<EvmPool>>,
+    /// Tracks circulating and burned WAVE supply.
+    pub supply_tracker: Arc<SupplyTracker>,
 }
 
 impl Oscillator {
@@ -101,6 +104,7 @@ impl Oscillator {
             certificate_tracker: Arc::new(CertificateTracker::new()),
             reward_pool: Arc::new(RwLock::new(RewardPool::new())),
             evm_pool: Arc::new(Mutex::new(EvmPool::new())),
+            supply_tracker: Arc::new(SupplyTracker::new()),
         }
     }
 
@@ -128,10 +132,12 @@ impl Oscillator {
         key_registry: &HashMap<AccountId, ed25519_dalek::VerifyingKey>,
     ) -> Result<(), SlashingReason> {
         let stake_table = self.stake_table.clone();
+        let supply_tracker = self.supply_tracker.clone();
         let stake_checker = |op: &AccountId| stake_table.is_staked(op);
         let stake_amount = |op: &AccountId| stake_table.get_stake(op);
         let mut slash = |op: AccountId| {
-            stake_table.slash(op);
+            let (_, burned) = stake_table.slash(op);
+            supply_tracker.burn(burned);
         };
         self.certificate_tracker
             .apply(cert, key_registry, &stake_checker, &stake_amount, &mut slash)
@@ -144,6 +150,15 @@ impl Oscillator {
     }
 
     pub fn seed_account(&self, account: AccountId, amount: u128) {
+        // Enforce the fixed 1B WAVE supply cap at the point of minting.
+        if !self.supply_tracker.mint(amount) {
+            tracing::warn!(
+                "seed_account for {} rejected: would exceed {} WAVE supply cap",
+                account,
+                crate::value::supply::TOTAL_WAVE_SUPPLY / crate::field::wave_field::WAVE_PRECISION
+            );
+            return;
+        }
         // Always acquire dag before wave_field to keep a consistent lock order
         // with synthesis (which locks dag then wave_field).
         let mut dag = self.dag.lock().unwrap();
@@ -151,6 +166,14 @@ impl Oscillator {
         drop(dag);
         let field = self.wave_field.lock().unwrap();
         field.credit_account(account, amount);
+    }
+
+    /// Mark an account as holding non-WAVE value (e.g. USDC or a bridged asset)
+    /// so it is exempt from metabolic decay.  Metabolic decay is WAVE's monetary
+    /// policy; foreign value must hold its worth.
+    pub fn mark_non_decaying(&self, account: AccountId) {
+        let field = self.wave_field.lock().unwrap();
+        field.set_non_decaying(account);
     }
 
     /// Ingest a single phase-shift. Deduplicates and queues for the next
@@ -177,8 +200,77 @@ impl Oscillator {
             tracing::warn!("stake rejected for {}: invalid signature", stake.operator);
             return false;
         }
+
+        let previous_locked = self.stake_table.get_stake(&stake.operator);
+        if stake.amount == previous_locked {
+            return true;
+        }
+
+        // Lock order: dag then wave_field, consistent with synthesis.
+        let mut dag = self.dag.lock().unwrap();
+        let field = self.wave_field.lock().unwrap();
+
+        if stake.amount > previous_locked {
+            let additional = stake.amount - previous_locked;
+            if field.account_balance(stake.operator).units < additional {
+                tracing::warn!(
+                    "stake rejected for {}: insufficient liquid balance (need {}, have {})",
+                    stake.operator,
+                    additional,
+                    field.account_balance(stake.operator).units
+                );
+                return false;
+            }
+            if !field.debit_account(stake.operator, additional) {
+                return false;
+            }
+            *dag.balances.entry(stake.operator).or_insert(0) = dag
+                .balances
+                .get(&stake.operator)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(additional);
+        } else {
+            let refund = previous_locked - stake.amount;
+            field.credit_account(stake.operator, refund);
+            *dag.balances.entry(stake.operator).or_insert(0) += refund;
+        }
+
+        drop(field);
+        drop(dag);
+
         self.stake_table.stake(stake.operator, stake.amount);
         true
+    }
+
+    /// Compute the execution fee for a stateful signal according to the fee
+    /// policy of its domain.  Returns the fee in sub-units and the post-fee
+    /// transfer amount.
+    pub fn compute_signal_fee(
+        &self,
+        shift: &StatefulShift,
+    ) -> Result<(u128, u128), String> {
+        use crate::consensus::domain::FeePolicy;
+        let policy = self
+            .domain_registry
+            .read()
+            .unwrap()
+            .get(&shift.domain)
+            .cloned()
+            .ok_or_else(|| format!("unknown domain {}", hex::encode(shift.domain)))?;
+        match policy.fee_policy {
+            FeePolicy::Flat(fee) => {
+                if shift.amount < fee {
+                    return Err("transfer amount does not cover flat fee".to_string());
+                }
+                Ok((fee, shift.amount - fee))
+            }
+            FeePolicy::Percentage(bp) => {
+                let fee = shift.amount.saturating_mul(bp as u128) / 10_000;
+                Ok((fee, shift.amount - fee))
+            }
+            FeePolicy::MetabolicOnly => Ok((0, shift.amount)),
+        }
     }
 
     /// Apply a registration event directly so every node learns the account.
@@ -193,6 +285,8 @@ impl Oscillator {
         field.ensure_account(reg.account);
         field.ensure_account(reg.wave_account);
         field.ensure_account(reg.usdc_account);
+        // USDC is foreign value and must not metabolically decay.
+        field.set_non_decaying(reg.usdc_account);
         if field.account_balance(reg.wave_account).units == 0 {
             field.credit_account(reg.wave_account, 10_000_000_000_000);
         }
@@ -271,11 +365,61 @@ impl Oscillator {
         // Increment monotonic synthesis tick at the start of each cycle.
         let tick = self.synthesis_tick.fetch_add(1, Ordering::SeqCst);
 
-        // 0. Metabolic decay: burn a deterministic amount per synthesis tick.
-        result.metabolic_burned = self.metabolic_engine.process_metabolic_degradation(tick);
-        {
+        // 0. Metabolic decay: exponentially decay every wave-field balance by
+        //    B(t) = B(0) * e^(-λt), using the DEX domain's λ.  Staked operators
+        //    are immune (their locked balances back the network).  Of the value
+        //    that decays away, a fixed fraction (`METABOLIC_BURN_BP`) is
+        //    permanently burned and the remainder is redistributed to operators
+        //    and liquidity providers below.
+        let immune_accounts: std::collections::HashSet<AccountId> = self
+            .stake_table
+            .staked_operators()
+            .into_iter()
+            .map(|(operator, _)| operator)
+            .collect();
+        let dex_lambda = self
+            .domain_registry
+            .read()
+            .unwrap()
+            .get(&crate::crypto::DEFAULT_DEX_DOMAIN)
+            .map(|p| p.metabolic_lambda_ppm)
+            .unwrap_or(crate::value::metabolic::DEFAULT_DEX_LAMBDA_PPM);
+        let decayed = {
+            let mut field = self.wave_field.lock().unwrap();
+            field.apply_metabolic_decay(tick, dex_lambda, &immune_accounts)
+        };
+        result.metabolic_burned = decayed;
+        // Record the total decayed value into the engine's running total for
+        // reporting surfaces (API / persistence).
+        self.metabolic_engine.record_burn(decayed);
+
+        // Deterministic integer split: burn a fixed fraction, redistribute the
+        // rest.  The remainder (and any rounding) always goes to rewards so no
+        // value is lost and every honest node computes the same partition.
+        let burn_share = decayed
+            .saturating_mul(crate::value::metabolic::METABOLIC_BURN_BP as u128)
+            / crate::value::metabolic::BASIS_POINTS_DENOMINATOR as u128;
+        let reward_share = decayed - burn_share;
+        if burn_share > 0 {
+            self.supply_tracker.burn(burn_share);
+        }
+        if reward_share > 0 {
             let reward_pool = self.reward_pool.read().unwrap();
-            reward_pool.distribute(result.metabolic_burned, &self.stake_table);
+            reward_pool.distribute(reward_share, &self.stake_table);
+        }
+
+        // 0b. Sync decayed wave-field balances into the DAG so that stateful
+        //     simulation and double-spend detection operate on the true,
+        //     metabolically-decayed available balances.
+        //     Lock order: dag first, then wave_field (consistent with the rest
+        //     of the oscillator and persistence::save).
+        {
+            let mut dag = self.dag.lock().unwrap();
+            let field = self.wave_field.lock().unwrap();
+            for entry in field.accounts.iter() {
+                dag.balances
+                    .insert(*entry.key(), entry.value().balance.units);
+            }
         }
 
         // 1. Move pending stateful shifts into the DAG.
@@ -351,14 +495,20 @@ impl Oscillator {
             }
         };
 
-        // Recompute balances from scratch each synthesis cycle for simplicity.
+        // Start from the cumulative DAG balances (already decayed) and apply only
+        // shifts that have not yet been applied.  Marking applied shifts prevents
+        // them from being replayed on subsequent ticks.  Fees are deducted from
+        // the sender and accrue to the reward pool according to the domain's fee
+        // policy.
         let mut simulated_balances = dag.balances.clone();
         let mut stateful_hashes = Vec::with_capacity(order.len());
+        let mut active_accounts = std::collections::HashSet::new();
+        let mut total_fees = 0u128;
         for hash in order {
             let node = dag.nodes.get(&hash).expect("hash in DAG");
 
-            // Skip shifts already rejected by double-spend detection.
-            if matches!(node.status, ShiftStatus::Rejected(_)) {
+            // Skip shifts already rejected by double-spend detection or applied.
+            if matches!(node.status, ShiftStatus::Rejected(_)) || node.applied {
                 continue;
             }
 
@@ -377,6 +527,14 @@ impl Oscillator {
                 continue;
             }
 
+            let (fee, net_amount) = match self.compute_signal_fee(shift) {
+                Ok(v) => v,
+                Err(_) => {
+                    result.stateful_rejected.push(DagError::InsufficientBalance(hash));
+                    continue;
+                }
+            };
+
             let balance = simulated_balances.get(&shift.from).copied().unwrap_or(0);
             if balance < shift.amount {
                 result
@@ -386,27 +544,84 @@ impl Oscillator {
             }
 
             *simulated_balances.get_mut(&shift.from).unwrap() -= shift.amount;
-            *simulated_balances.entry(shift.to).or_insert(0) += shift.amount;
+            *simulated_balances.entry(shift.to).or_insert(0) += net_amount;
+            total_fees = total_fees.saturating_add(fee);
             result.stateful_applied += 1;
             stateful_hashes.push(hash);
+            // Record both parties as active so they receive metabolic-decay
+            // grace starting next tick.  Self-transfers do not count as real
+            // economic activity, otherwise a whale could bypass decay for free by
+            // scripting transfers to themselves.
+            if shift.from != shift.to {
+                active_accounts.insert(shift.from);
+                active_accounts.insert(shift.to);
+            }
         }
+        drop(dag);
 
         // 3b. Apply verified EVM transactions in nonce order.
         let evm_hashes = {
             let mut evm_pool = self.evm_pool.lock().unwrap();
-            let (evm_applied, evm_latency_ms, hashes) = evm_pool.synthesize(&mut simulated_balances, finalized_at, tick);
+            let (evm_applied, evm_latency_ms, hashes) = evm_pool.synthesize(
+                &mut simulated_balances, finalized_at, tick);
             result.evm_applied = evm_applied;
             finalized_count += evm_applied;
             finalized_latency_ms += evm_latency_ms;
             hashes
         };
 
-        // Sync wave-field account balances with DAG result.
+        // Deduct accumulated signal fees from the wave-field sender balances and
+        // add them to the reward pool.  Compute fee_debt while holding the DAG,
+        // then release it before touching wave_field to preserve the global
+        // dag-first lock order.
+        if total_fees > 0 {
+            let mut fee_debt: std::collections::HashMap<AccountId, u128> = std::collections::HashMap::new();
+            {
+                let dag = self.dag.lock().unwrap();
+                for hash in &stateful_hashes {
+                    if let Some(node) = dag.nodes.get(hash) {
+                        let (fee, _) = self.compute_signal_fee(&node.shift).unwrap_or((0, node.shift.amount));
+                        *fee_debt.entry(node.shift.from).or_insert(0) += fee;
+                    }
+                }
+            }
+            {
+                let field = self.wave_field.lock().unwrap();
+                for (account, fee) in fee_debt {
+                    field.debit_account(account, fee.min(field.account_balance(account).units));
+                }
+            }
+            {
+                let reward_pool = self.reward_pool.read().unwrap();
+                reward_pool.distribute_fees(total_fees, &self.stake_table);
+            }
+        }
+
+        // Commit applied stateful shifts and the cumulative balance set back to
+        // the DAG so future ticks do not replay already-settled shifts.
+        {
+            let mut dag = self.dag.lock().unwrap();
+            for hash in &stateful_hashes {
+                if let Some(node) = dag.nodes.get_mut(hash) {
+                    node.applied = true;
+                }
+            }
+            dag.balances = simulated_balances.clone();
+        }
+
+        // Sync wave-field account balances with DAG result.  Because fees were
+        // already debited above, only transfer the net simulated balances here
+        // so we do not double-charge the sender.
         let field = self.wave_field.lock().unwrap();
         for (account, balance) in &simulated_balances {
             field.ensure_account(*account);
             if let Some(mut state) = field.accounts.get_mut(account) {
                 state.balance.units = *balance;
+                // Accounts touched by an applied stateful shift this tick start
+                // their activity grace window.
+                if active_accounts.contains(account) {
+                    state.balance.last_active_tick = tick;
+                }
             }
         }
         result.final_balances = simulated_balances.clone();

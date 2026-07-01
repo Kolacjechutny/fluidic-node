@@ -26,6 +26,9 @@ pub struct DagNode {
     pub first_seen_at_ns: u64,
     /// Synthesis tick at which this node was promoted to finalized.
     pub finalized_at_tick: Option<u64>,
+    /// Whether this shift has already been applied to the cumulative balances.
+    /// Applied shifts are skipped during synthesis so they are not replayed.
+    pub applied: bool,
 }
 
 /// Error variants returned by the DAG validator.
@@ -112,6 +115,7 @@ impl VectorClockDag {
             finalization_depth,
             first_seen_at_ns,
             finalized_at_tick: None,
+            applied: false,
         };
 
         // Update causal bookkeeping.

@@ -60,14 +60,17 @@ impl StakeTable {
         &self.config
     }
 
-    /// Lock stake for an operator. Replaces any existing stake.
-    pub fn stake(&self, operator: AccountId, amount: u128) {
+    /// Lock stake for an operator.  Returns the previous locked amount so
+    /// callers can reconcile the operator's liquid balance.
+    pub fn stake(&self, operator: AccountId, amount: u128) -> u128 {
         let mut ops = self.operators.write().unwrap();
         let entry = ops.entry(operator).or_insert_with(|| OperatorEntry {
             stake: 0,
             slash_nonce: None,
         });
+        let previous = entry.stake;
         entry.stake = amount;
+        previous
     }
 
     pub fn get_stake(&self, operator: &AccountId) -> u128 {
@@ -94,6 +97,7 @@ impl StakeTable {
             .read()
             .unwrap()
             .values()
+            .filter(|e| e.slash_nonce.is_none())
             .map(|e| e.stake)
             .sum()
     }
@@ -119,7 +123,9 @@ impl StakeTable {
             .unwrap_or(false)
     }
 
-    pub fn slash(&self, operator: AccountId) -> u64 {
+    /// Burn an operator's locked stake when they are slashed.  Returns the
+    /// slash nonce and the amount burned.
+    pub fn slash(&self, operator: AccountId) -> (u64, u128) {
         let nonce = self.slash_counter.fetch_add(1, Ordering::SeqCst);
         let mut ops = self.operators.write().unwrap();
         let entry = ops.entry(operator).or_insert_with(|| OperatorEntry {
@@ -127,7 +133,9 @@ impl StakeTable {
             slash_nonce: None,
         });
         entry.slash_nonce = Some(nonce);
-        nonce
+        let burned = entry.stake;
+        entry.stake = 0;
+        (nonce, burned)
     }
 
     pub fn is_slashed(&self, operator: &AccountId) -> bool {
@@ -247,14 +255,15 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_roundtrip_preserves_stake_and_slash() {
+    fn snapshot_roundtrip_preserves_slash_and_burned_stake() {
         let table = StakeTable::new(StakingConfig { min_stake: 100 });
         let op = AccountId([3u8; 32]);
         table.stake(op, 200);
-        table.slash(op);
+        let (_, burned) = table.slash(op);
+        assert_eq!(burned, 200);
         let snap = table.to_snapshot();
         let restored = StakeTable::from_snapshot(StakingConfig { min_stake: 100 }, snap);
-        assert_eq!(restored.get_stake(&op), 200);
+        assert_eq!(restored.get_stake(&op), 0);
         assert!(restored.is_slashed(&op));
         assert!(!restored.is_staked(&op));
     }

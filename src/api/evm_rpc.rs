@@ -401,6 +401,7 @@ async fn send_raw_transaction(
         from: Some(from_hex),
         to: to_hex,
         amount: Some(value_str),
+        token: Some("ETH".to_string()),
         timestamp_ns: 0,
     });
 
