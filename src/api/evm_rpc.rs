@@ -124,6 +124,11 @@ async fn dispatch(
         "eth_getTransactionCount" => get_transaction_count(state, min_tick, req.params).await,
         "eth_estimateGas" => estimate_gas(state, min_tick, req.params).await,
         "eth_getLogs" => get_logs(state, min_tick, req.params).await,
+        "eth_feeHistory" => fee_history(req.params).await,
+        "eth_maxPriorityFeePerGas" => Ok(Value::String("0x0".to_string())),
+        "eth_syncing" => Ok(Value::Bool(false)),
+        "eth_mining" => Ok(Value::Bool(false)),
+        "net_listening" => Ok(Value::Bool(true)),
         "web3_clientVersion" => Ok(Value::String("fluidic/0.1.0".to_string())),
         _ => Err((
             -32601,
@@ -788,6 +793,28 @@ fn tx_hash_bytes(hash: &H256) -> [u8; 32] {
 /// EVM-style debug namespace endpoint used by some explorers.
 pub async fn rpc_health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// Return a fee history stub. Wallets call this to estimate priority fees; the
+/// mesh has no base fee, so all values are zero.
+async fn fee_history(params: Vec<Value>) -> Result<Value, (i64, String)> {
+    let block_count = params
+        .first()
+        .and_then(|v| v.as_str())
+        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(1);
+    let oldest_block = "0x0".to_string();
+    let base_fee_per_gas: Vec<String> = (0..=block_count).map(|_| "0x0".to_string()).collect();
+    let gas_used_ratio: Vec<f64> = (0..block_count).map(|_| 0.0).collect();
+    let reward: Vec<Vec<String>> = (0..block_count)
+        .map(|_| vec!["0x0".to_string()])
+        .collect();
+    Ok(serde_json::json!({
+        "oldestBlock": oldest_block,
+        "baseFeePerGas": base_fee_per_gas,
+        "gasUsedRatio": gas_used_ratio,
+        "reward": reward,
+    }))
 }
 
 #[cfg(test)]

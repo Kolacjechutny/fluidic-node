@@ -13,10 +13,12 @@
 //! > been audited or deployed to a permissionless mainnet.
 
 pub mod api;
+pub mod bridge;
 pub mod consensus;
 pub mod crypto;
 pub mod evm;
 pub mod field;
+pub mod light_client;
 pub mod network;
 pub mod operator;
 pub mod persistence;

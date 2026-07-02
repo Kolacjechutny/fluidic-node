@@ -5,7 +5,7 @@ use crate::consensus::certificate::{
 use crate::consensus::dag::{DagError, ShiftStatus, VectorClockDag};
 use crate::consensus::domain::{DomainRegistry, OrderingMode};
 use crate::crypto::{
-    AccountId, CommutativeShift, KeyPair, PoolId, RegistrationShift, Signal, StakeShift,
+    AccountId, CommutativeShift, DomainId, KeyPair, PoolId, RegistrationShift, Signal, StakeShift,
     StatefulShift, VectorClock,
 };
 use crate::evm::EvmPool;
@@ -55,10 +55,14 @@ pub struct Oscillator {
     pub keypair: KeyPair,
     pub vector_clock: Arc<Mutex<VectorClock>>,
     /// Pending commutative deltas waiting for the next NTT synthesis window.
-    pub pending_commutative: Arc<Mutex<Vec<(Coordinate, i128, PoolId)>>>,
+    /// Each entry carries its target domain so per-domain policy is respected.
+    pub pending_commutative: Arc<Mutex<Vec<(DomainId, Coordinate, i128, PoolId)>>>,
     /// Pending stateful shifts awaiting DAG insertion during synthesis.
     pub pending_stateful: Arc<Mutex<Vec<StatefulShift>>>,
     pub seen_signatures: DashMap<Vec<u8>, ()>,
+    /// Highest observed nonce per (account, domain) for replay protection.
+    /// Global signals (registration, stake) use a zeroed DomainId sentinel.
+    pub seen_nonces: DashMap<(AccountId, DomainId), u64>,
     pub metabolic_engine: Arc<MetabolicDecayEngine>,
     /// Monotonically increasing synthesis tick counter.
     pub synthesis_tick: AtomicU64,
@@ -95,6 +99,7 @@ impl Oscillator {
             pending_commutative: Arc::new(Mutex::new(Vec::new())),
             pending_stateful: Arc::new(Mutex::new(Vec::new())),
             seen_signatures: DashMap::new(),
+            seen_nonces: DashMap::new(),
             metabolic_engine: Arc::new(MetabolicDecayEngine::new()),
             synthesis_tick: AtomicU64::new(0),
             domain_registry: Arc::new(RwLock::new(DomainRegistry::new())),
@@ -122,6 +127,26 @@ impl Oscillator {
 
     pub fn set_operator_keypair(&mut self, keypair: KeyPair) {
         self.operator_keypair = Some(keypair);
+    }
+
+    /// Check and record a sender-domain nonce for replay protection.
+    fn check_and_record_nonce(&self, account: AccountId, domain: DomainId, nonce: u64) -> Result<(), String> {
+        let key = (account, domain);
+        match self.seen_nonces.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                if nonce <= *entry.get() {
+                    return Err(format!(
+                        "replay: nonce {} is not greater than highest seen {} for account {} in domain {}",
+                        nonce, entry.get(), account, hex::encode(domain)
+                    ));
+                }
+                *entry.get_mut() = nonce;
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(nonce);
+            }
+        }
+        Ok(())
     }
 
     /// Ingest a peer synthesis certificate.  Conflicting certificates from the
@@ -176,6 +201,64 @@ impl Oscillator {
         field.set_non_decaying(account);
     }
 
+    /// Register a new concurrency domain. The registrant pays a one-time
+    /// reservation fee in WAVE, which is redistributed to operators and LPs.
+    /// Returns `Ok(())` on success or an error if the policy is invalid, the
+    /// domain already exists, or the registrant cannot afford the fee.
+    pub fn register_domain(
+        &self,
+        policy: crate::consensus::domain::DomainPolicy,
+        registrant: AccountId,
+    ) -> Result<(), String> {
+        let fee = crate::consensus::domain::domain_reservation_fee_units();
+
+        // Validate and freeze the policy first.
+        let policy = crate::consensus::domain::DomainPolicy::new(
+            policy.domain,
+            policy.commutative,
+            policy.stateful,
+            policy.ordering,
+            policy.finalization_depth,
+            policy.metabolic_lambda_ppm,
+            policy.fee_policy,
+        )?;
+
+        {
+            let registry = self.domain_registry.read().unwrap();
+            if registry.contains(&policy.domain) {
+                return Err(format!(
+                    "domain {} is already registered",
+                    hex::encode(policy.domain)
+                ));
+            }
+        }
+
+        // Deduct reservation fee and credit reward pool.
+        {
+            let field = self.wave_field.lock().unwrap();
+            if field.account_balance(registrant).units < fee {
+                return Err(format!(
+                    "insufficient balance to reserve domain {}: need {}, have {}",
+                    hex::encode(policy.domain),
+                    fee,
+                    field.account_balance(registrant).units
+                ));
+            }
+            if !field.debit_account(registrant, fee) {
+                return Err("failed to debit domain reservation fee".to_string());
+            }
+        }
+        {
+            let reward_pool = self.reward_pool.read().unwrap();
+            reward_pool.distribute_fees(fee, &self.stake_table);
+        }
+
+        // Register the domain.
+        let mut registry = self.domain_registry.write().unwrap();
+        registry.register(policy);
+        Ok(())
+    }
+
     /// Ingest a single phase-shift. Deduplicates and queues for the next
     /// synthesis cycle.
     pub fn ingest(&self, shift: Signal) -> Result<(), String> {
@@ -198,6 +281,10 @@ impl Oscillator {
     pub fn apply_stake(&self, stake: &StakeShift) -> bool {
         if !stake.verify() {
             tracing::warn!("stake rejected for {}: invalid signature", stake.operator);
+            return false;
+        }
+        if let Err(e) = self.check_and_record_nonce(stake.operator, DomainId::default(), stake.nonce) {
+            tracing::warn!("stake rejected for {}: {}", stake.operator, e);
             return false;
         }
 
@@ -276,6 +363,11 @@ impl Oscillator {
     /// Apply a registration event directly so every node learns the account.
     /// The caller must register the public key in the API registry separately.
     pub fn apply_registration(&self, reg: &RegistrationShift) {
+        if let Err(e) = self.check_and_record_nonce(reg.account, DomainId::default(), reg.nonce) {
+            tracing::warn!("registration rejected for {}: {}", reg.account, e);
+            return;
+        }
+
         // Keep lock order consistent with synthesis: dag first, then wave_field.
         let mut dag = self.dag.lock().unwrap();
         dag.seed_balance(reg.wave_account, 10_000_000_000_000);
@@ -309,6 +401,12 @@ impl Oscillator {
                 hex::encode(shift.domain)
             ));
         }
+        // TODO: commutative shifts currently carry no authenticated `from` field,
+        // so per-sender-domain nonce replay protection cannot be enforced here.
+        // Signature-hash deduplication prevents identical shift replay, which is
+        // sufficient for state-independent commutative deltas but does not match
+        // the whitepaper's "sender-domain nonce" wording. Add `from` + signature
+        // verification to close this gap.
         if self.seen_signatures.contains_key(&shift.signature) {
             return Ok(()); // already processed
         }
@@ -316,7 +414,7 @@ impl Oscillator {
         let mut pending = self.pending_commutative.lock().unwrap();
         // Latency for commutative signals is tracked by the batch synthesis
         // interval; individual first-seen times are not recorded.
-        pending.push((shift.coordinate, shift.delta, shift.pool_id));
+        pending.push((shift.domain, shift.coordinate, shift.delta, shift.pool_id));
         Ok(())
     }
 
@@ -334,9 +432,10 @@ impl Oscillator {
                 hex::encode(shift.domain)
             ));
         }
-        if policy.ordering == OrderingMode::Fifo && !shift.predecessors.is_empty() {
-            return Err("FIFO domain does not accept predecessor edges".to_string());
+        if policy.ordering == OrderingMode::Commutative && !shift.predecessors.is_empty() {
+            return Err("commutative domain does not accept predecessor edges".to_string());
         }
+        self.check_and_record_nonce(shift.from, shift.domain, shift.nonce)?;
         if self.seen_signatures.contains_key(&shift.signature) {
             return Ok(());
         }
@@ -467,21 +566,60 @@ impl Oscillator {
             finalized_latency_ms += promoted_latency_ms;
         }
 
-        // 2. Synthesize commutative batch.
+        // 2. Synthesize commutative batches, one per registered domain that allows
+        //    commutative signals. This respects per-domain policy instead of
+        //    aggregating all commutative deltas into a single global batch.
         let mut comm_root = [0u8; 32];
         {
             let mut pending = self.pending_commutative.lock().unwrap();
             if !pending.is_empty() {
-                let deltas: Vec<(Coordinate, i128, PoolId)> = pending.drain(..).collect();
-                result.commutative_applied = deltas.len();
-                comm_root = commutative_root(tick, &deltas);
-                let mut field = self.wave_field.lock().unwrap();
-                if let Err(e) = field.synthesize_commutative_batch(&deltas) {
-                    warn!("commutative synthesis failed: {}", e);
-                    pending.extend(deltas);
-                    result.commutative_applied = 0;
-                    comm_root = [0u8; 32];
+                let deltas: Vec<(DomainId, Coordinate, i128, PoolId)> = pending.drain(..).collect();
+                drop(pending);
+
+                let registry = self.domain_registry.read().unwrap();
+                let mut by_domain: std::collections::HashMap<DomainId, Vec<(Coordinate, i128, PoolId)>> =
+                    std::collections::HashMap::new();
+                for (domain, coord, delta, pool) in deltas {
+                    match registry.get(&domain) {
+                        Some(policy) if policy.commutative => {
+                            by_domain.entry(domain).or_default().push((coord, delta, pool));
+                        }
+                        Some(_) => {
+                            tracing::warn!(
+                                "commutative shift for non-commutative domain {} dropped",
+                                hex::encode(domain)
+                            );
+                        }
+                        None => {
+                            tracing::warn!(
+                                "commutative shift for unknown domain {} dropped",
+                                hex::encode(domain)
+                            );
+                        }
+                    }
                 }
+                drop(registry);
+
+                let mut field = self.wave_field.lock().unwrap();
+                let mut total_applied = 0usize;
+                for (domain, domain_deltas) in by_domain {
+                    if domain_deltas.is_empty() {
+                        continue;
+                    }
+                    comm_root = commutative_root(tick, &domain_deltas);
+                    if let Err(e) = field.synthesize_commutative_batch(&domain_deltas) {
+                        warn!("commutative synthesis failed for domain {}: {}", hex::encode(domain), e);
+                        // Re-queue only the failed domain's deltas so others are not lost.
+                        let mut pending = self.pending_commutative.lock().unwrap();
+                        for (coord, delta, pool) in domain_deltas {
+                            pending.push((domain, coord, delta, pool));
+                        }
+                        comm_root = [0u8; 32];
+                    } else {
+                        total_applied += domain_deltas.len();
+                    }
+                }
+                result.commutative_applied = total_applied;
             }
         }
 
@@ -525,6 +663,29 @@ impl Oscillator {
                     .stateful_rejected
                     .push(DagError::InvalidSignature(hash));
                 continue;
+            }
+
+            let policy = match self.domain_registry.read().unwrap().get(&shift.domain) {
+                Some(p) => p.clone(),
+                None => {
+                    // Domain was validated at ingest time; missing here is an
+                    // inconsistent state. Skip rather than panic.
+                    tracing::warn!(
+                        "strict check: unknown domain {} for shift {}",
+                        hex::encode(shift.domain),
+                        hex::encode(hash)
+                    );
+                    continue;
+                }
+            };
+
+            // Strict domains require an operator quorum certificate for the tick
+            // in which the shift was inserted before it can be applied.
+            if policy.ordering == OrderingMode::Strict {
+                if self.check_quorum(node.inserted_at_tick).is_none() {
+                    // Skip for now; will retry on a later tick once quorum exists.
+                    continue;
+                }
             }
 
             let (fee, net_amount) = match self.compute_signal_fee(shift) {
@@ -696,6 +857,151 @@ mod tests {
     use crate::crypto::keys::KeyPair;
 
     #[test]
+    fn oscillator_rejects_replayed_nonce() {
+        let osc = Oscillator::new([1u8; 32], 64);
+        let alice = KeyPair::generate();
+        let bob = KeyPair::generate();
+        osc.seed_account(alice.account_id(), 10_000_000_000_000);
+
+        let mut vc = VectorClock::new();
+        vc.tick(osc.id);
+        let st1 = StatefulShift::new(
+            &alice,
+            DEFAULT_DEX_DOMAIN,
+            bob.account_id(),
+            100,
+            vc.clone(),
+            vec![],
+            1,
+            0,
+        );
+        osc.ingest(Signal::Stateful(st1)).unwrap();
+
+        // Same nonce should be rejected.
+        let st2 = StatefulShift::new(
+            &alice,
+            DEFAULT_DEX_DOMAIN,
+            bob.account_id(),
+            200,
+            vc.clone(),
+            vec![],
+            1,
+            0,
+        );
+        assert!(osc.ingest(Signal::Stateful(st2)).is_err());
+
+        // Higher nonce is accepted.
+        let st3 = StatefulShift::new(
+            &alice,
+            DEFAULT_DEX_DOMAIN,
+            bob.account_id(),
+            200,
+            vc,
+            vec![],
+            2,
+            0,
+        );
+        osc.ingest(Signal::Stateful(st3)).unwrap();
+    }
+
+    #[test]
+    fn oscillator_registers_domain_and_deducts_fee() {
+        let osc = Oscillator::new([1u8; 32], 64);
+        let alice = KeyPair::generate();
+        let fee = crate::consensus::domain::domain_reservation_fee_units();
+        osc.seed_account(alice.account_id(), fee + 1_000_000_000_000);
+
+        let domain_id = [7u8; 32];
+        let policy = crate::consensus::domain::DomainPolicy::new(
+            domain_id,
+            true,
+            true,
+            crate::consensus::domain::OrderingMode::Causal,
+            3,
+            20,
+            crate::consensus::domain::FeePolicy::MetabolicOnly,
+        )
+        .unwrap();
+
+        let balance_before = osc
+            .wave_field
+            .lock()
+            .unwrap()
+            .account_balance(alice.account_id())
+            .units;
+        osc.register_domain(policy, alice.account_id()).unwrap();
+        let balance_after = osc
+            .wave_field
+            .lock()
+            .unwrap()
+            .account_balance(alice.account_id())
+            .units;
+
+        assert_eq!(balance_before - balance_after, fee);
+        assert!(osc.domain_registry.read().unwrap().contains(&domain_id));
+    }
+
+    #[test]
+    fn oscillator_strict_domain_waits_for_quorum() {
+        let mut osc = Oscillator::new([1u8; 32], 64);
+        let operator = KeyPair::generate();
+        let alice = KeyPair::generate();
+        let bob = KeyPair::generate();
+
+        // Seed accounts and stake the operator so quorum certificates can be
+        // produced. The default min_stake is 1_000_000_000_000_000_000.
+        osc.seed_account(operator.account_id(), 2_000_000_000_000_000_000);
+        osc.seed_account(alice.account_id(), 1_000_000_000_000);
+        osc.set_operator_keypair(operator.clone());
+
+        // Register a strict domain.
+        let strict_domain = [42u8; 32];
+        let policy = crate::consensus::domain::DomainPolicy::new(
+            strict_domain,
+            false,
+            true,
+            crate::consensus::domain::OrderingMode::Strict,
+            3,
+            20,
+            crate::consensus::domain::FeePolicy::MetabolicOnly,
+        )
+        .unwrap();
+        osc.register_domain(policy, operator.account_id()).unwrap();
+
+        // Stake the operator before synthesis so a quorum certificate is produced
+        // for the tick in which the strict shift is inserted.
+        osc.stake_table.stake(operator.account_id(), 1_000_000_000_000_000_000);
+
+        // Create a stateful shift in the strict domain.
+        let mut vc = VectorClock::new();
+        vc.tick(osc.id);
+        let st = StatefulShift::new(
+            &alice,
+            strict_domain,
+            bob.account_id(),
+            500,
+            vc,
+            vec![],
+            1,
+            0,
+        );
+        osc.ingest(Signal::Stateful(st)).unwrap();
+
+        // First synthesis: strict shift is inserted but skipped because quorum for
+        // its insertion tick does not yet exist (certificate is produced at end).
+        let mut registry = HashMap::new();
+        registry.insert(alice.account_id(), alice.public_key());
+        registry.insert(operator.account_id(), operator.public_key());
+        let result1 = osc.synthesize(&registry);
+        assert_eq!(result1.stateful_applied, 0);
+
+        // Second synthesis: the certificate from tick 0 now provides quorum, so
+        // the strict shift applies.
+        let result2 = osc.synthesize(&registry);
+        assert_eq!(result2.stateful_applied, 1);
+    }
+
+    #[test]
     fn oscillator_aggregates_commutative_and_applies_stateful() {
         let osc = Oscillator::new([1u8; 32], 64);
         let alice = KeyPair::generate();
@@ -720,7 +1026,8 @@ mod tests {
         // Stateful: send 500 to Bob.
         let mut vc = VectorClock::new();
         vc.tick(osc.id);
-        let st = StatefulShift::new(&alice, DEFAULT_DEX_DOMAIN, bob.account_id(), 500, vc, vec![], 1, 0);
+        let st = StatefulShift::new(
+            &alice, DEFAULT_DEX_DOMAIN, bob.account_id(), 500, vc, vec![], 1, 0);
         osc.ingest(Signal::Stateful(st)).unwrap();
 
         let mut registry = HashMap::new();

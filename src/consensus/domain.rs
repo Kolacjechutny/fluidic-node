@@ -1,13 +1,27 @@
 use crate::crypto::{DEFAULT_DEX_DOMAIN, DomainId};
 use std::collections::HashMap;
 
-/// How stateful signals within a concurrency domain are ordered.
+/// Number of whole WAVE tokens required to reserve/register a new concurrency
+/// domain. Paid once per domain and redistributed to operators/LPs.
+pub const DOMAIN_RESERVATION_FEE_WAVE: u128 = 100;
+
+/// Reservation fee in sub-units (precision-aware).
+pub fn domain_reservation_fee_units() -> u128 {
+    DOMAIN_RESERVATION_FEE_WAVE * crate::field::wave_field::WAVE_PRECISION
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OrderingMode {
     /// Causal, vector-clock DAG ordering (default for state-dependent value).
-    Dag,
+    /// Maps to the whitepaper's "causal" domain policy.
+    Causal,
     /// First-in-first-out ordering across the domain.
-    Fifo,
+    /// Maps to the whitepaper's "commutative" domain policy when combined with
+    /// `commutative = true`.
+    Commutative,
+    /// Strict ordering: every stateful signal requires an explicit operator
+    /// quorum certificate before it is applied. Maps to the whitepaper's
+    /// "strict" domain policy.
+    Strict,
 }
 
 /// How a concurrency domain charges for execution.
@@ -44,19 +58,51 @@ pub struct DomainPolicy {
 }
 
 impl DomainPolicy {
-    /// The built-in DEX domain: both commutative and stateful signals, DAG
-    /// ordering, a conservative finalization depth, the default DEX decay
+    /// The built-in DEX domain: both commutative and stateful signals, causal
+    /// (DAG) ordering, a conservative finalization depth, the default DEX decay
     /// constant (λ = 20 ppm/tick), and no explicit fee beyond metabolic decay.
     pub fn dex_default() -> Self {
         Self {
             domain: DEFAULT_DEX_DOMAIN,
             commutative: true,
             stateful: true,
-            ordering: OrderingMode::Dag,
+            ordering: OrderingMode::Causal,
             finalization_depth: 3,
             metabolic_lambda_ppm: crate::value::metabolic::DEFAULT_DEX_LAMBDA_PPM,
             fee_policy: FeePolicy::MetabolicOnly,
         }
+    }
+
+    /// Build a new domain policy. Validates invariants; returns `Err` if the
+    /// policy is invalid (e.g. decay rate out of range).
+    pub fn new(
+        domain: DomainId,
+        commutative: bool,
+        stateful: bool,
+        ordering: OrderingMode,
+        finalization_depth: u64,
+        metabolic_lambda_ppm: u64,
+        fee_policy: FeePolicy,
+    ) -> Result<Self, String> {
+        if metabolic_lambda_ppm >= crate::value::metabolic::DECAY_DENOMINATOR {
+            return Err(format!(
+                "metabolic_lambda_ppm {} must be strictly less than {}",
+                metabolic_lambda_ppm,
+                crate::value::metabolic::DECAY_DENOMINATOR
+            ));
+        }
+        if finalization_depth == 0 {
+            return Err("finalization_depth must be > 0".to_string());
+        }
+        Ok(Self {
+            domain,
+            commutative,
+            stateful,
+            ordering,
+            finalization_depth,
+            metabolic_lambda_ppm,
+            fee_policy,
+        })
     }
 
     /// Convenience builder for domains that want a different metabolic decay
@@ -112,7 +158,7 @@ mod tests {
         let policy = reg.get(&DEFAULT_DEX_DOMAIN).unwrap();
         assert!(policy.commutative);
         assert!(policy.stateful);
-        assert_eq!(policy.ordering, OrderingMode::Dag);
+        assert_eq!(policy.ordering, OrderingMode::Causal);
         assert_eq!(policy.finalization_depth, 3);
         assert_eq!(
             policy.metabolic_lambda_ppm,

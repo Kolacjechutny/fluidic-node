@@ -1,4 +1,5 @@
 use crate::api::state::{ApiState, RecentShift, build_pool_payout_shift};
+use crate::consensus::domain::{DomainPolicy, FeePolicy, OrderingMode};
 use crate::consensus::dag::{DagError, ShiftStatus, VectorClockDag};
 use crate::crypto::{AccountId, CommutativeShift, KeyPair, Signal, StakeShift, StatefulShift};
 use crate::evm::{block_hash_for, evm_address_to_fluidic};
@@ -36,7 +37,7 @@ pub fn api_router() -> Router<Arc<ApiState>> {
         .route("/api/rewards/claim", post(claim_operator_rewards))
         .route("/api/rewards/lp/:pool_id/claim", post(claim_lp_rewards))
         .route("/api/supply", get(get_supply))
-        .route("/api/domains", get(get_domains))
+        .route("/api/domains", get(get_domains).post(register_domain))
         .route("/api/domain/:id", get(get_domain))
         .route("/api/evm/faucet", post(evm_faucet))
         .route("/api/sync/state", get(get_sync_state))
@@ -820,8 +821,9 @@ fn domain_policy_json(
         "commutative": policy.commutative,
         "stateful": policy.stateful,
         "ordering": match policy.ordering {
-            OrderingMode::Dag => "dag",
-            OrderingMode::Fifo => "fifo",
+            OrderingMode::Causal => "causal",
+            OrderingMode::Commutative => "commutative",
+            OrderingMode::Strict => "strict",
         },
         "finalization_depth": policy.finalization_depth,
         "metabolic_lambda_ppm": policy.metabolic_lambda_ppm,
@@ -891,6 +893,125 @@ async fn get_domain(
         map.insert("recent_shifts".to_string(), serde_json::json!(recent));
     }
     Ok(Json(body))
+}
+
+#[derive(Deserialize)]
+struct RegisterDomainRequest {
+    domain: String,
+    commutative: bool,
+    stateful: bool,
+    ordering: String,
+    finalization_depth: u64,
+    metabolic_lambda_ppm: u64,
+    fee_policy: String,
+    fee_amount: Option<String>,
+    registrant: String,
+    signature: String,
+}
+
+async fn register_domain(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<RegisterDomainRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let domain = parse_domain(&req.domain).map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid domain: {:?}", e)))?;
+    let registrant = parse_account(&req.registrant)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid registrant: {}", e)))?;
+    let signature = hex::decode(&req.signature)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid signature hex".to_string()))?;
+
+    let ordering = match req.ordering.as_str() {
+        "causal" => OrderingMode::Causal,
+        "commutative" => OrderingMode::Commutative,
+        "strict" => OrderingMode::Strict,
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("unknown ordering mode: {}", other),
+            ));
+        }
+    };
+
+    let fee_policy = match req.fee_policy.as_str() {
+        "metabolic_only" => FeePolicy::MetabolicOnly,
+        "flat" => {
+            let amount = req
+                .fee_amount
+                .as_ref()
+                .ok_or((StatusCode::BAD_REQUEST, "flat fee requires fee_amount".to_string()))?
+                .parse::<u128>()
+                .map_err(|_| (StatusCode::BAD_REQUEST, "invalid fee_amount".to_string()))?;
+            FeePolicy::Flat(amount)
+        }
+        "percentage" => {
+            let bp = req
+                .fee_amount
+                .as_ref()
+                .ok_or((StatusCode::BAD_REQUEST, "percentage fee requires fee_amount basis points".to_string()))?
+                .parse::<u64>()
+                .map_err(|_| (StatusCode::BAD_REQUEST, "invalid fee_amount".to_string()))?;
+            FeePolicy::Percentage(bp)
+        }
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("unknown fee_policy: {}", other),
+            ));
+        }
+    };
+
+    let policy = DomainPolicy::new(
+        domain,
+        req.commutative,
+        req.stateful,
+        ordering,
+        req.finalization_depth,
+        req.metabolic_lambda_ppm,
+        fee_policy,
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    // Verify the registrant signed the canonical domain policy bytes.
+    let signing_bytes = domain_registration_signing_bytes(&policy,
+        crate::consensus::domain::domain_reservation_fee_units(),
+    );
+    let registry = state.registry.read().unwrap();
+    let pk = registry
+        .get(&registrant)
+        .ok_or((StatusCode::UNAUTHORIZED, "unknown registrant".to_string()))?;
+    let sig = Signature::from_slice(&signature)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid signature bytes".to_string()))?;
+    if !KeyPair::verify(pk, &signing_bytes, &sig) {
+        return Err((StatusCode::UNAUTHORIZED, "invalid signature".to_string()));
+    }
+    drop(registry);
+
+    state
+        .oscillator
+        .register_domain(policy, registrant)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    Ok(Json(serde_json::json!({
+        "status": "registered",
+        "domain": req.domain,
+        "reservation_fee": crate::consensus::domain::DOMAIN_RESERVATION_FEE_WAVE.to_string(),
+    })))
+}
+
+fn domain_registration_signing_bytes(policy: &DomainPolicy, fee: u128) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(256);
+    buf.extend_from_slice(b"FLUIDIC:REGISTER_DOMAIN:v1");
+    buf.extend_from_slice(&policy.domain);
+    buf.push(policy.commutative as u8);
+    buf.push(policy.stateful as u8);
+    buf.push(match policy.ordering {
+        OrderingMode::Causal => 0,
+        OrderingMode::Commutative => 1,
+        OrderingMode::Strict => 2,
+    });
+    buf.extend_from_slice(&policy.finalization_depth.to_le_bytes());
+    buf.extend_from_slice(&policy.metabolic_lambda_ppm.to_le_bytes());
+    buf.extend_from_slice(&fee.to_le_bytes());
+    buf
 }
 
 async fn get_recent_shifts(

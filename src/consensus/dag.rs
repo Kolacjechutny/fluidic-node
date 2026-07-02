@@ -1,5 +1,5 @@
 use crate::crypto::{StatefulShift, TxHash, VectorClock};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 /// Lifecycle status of a stateful shift in the DAG.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -263,6 +263,9 @@ impl VectorClockDag {
     }
 
     /// Return a topological ordering of all DAG nodes, starting from roots.
+    /// When multiple nodes are ready, prefer the one whose vector clock
+    /// happened-before all other ready nodes, matching the whitepaper's causal
+    /// precedence rule. Concurrent nodes are ordered deterministically by hash.
     /// Returns an error if a cycle is detected (should be impossible with hash-prefixed refs).
     pub fn topological_order(&self) -> Result<Vec<TxHash>, DagError> {
         let mut in_degree: HashMap<TxHash, usize> = HashMap::new();
@@ -273,7 +276,7 @@ impl VectorClockDag {
             }
         }
 
-        let mut queue: VecDeque<TxHash> = self
+        let mut ready: Vec<TxHash> = self
             .roots
             .iter()
             .filter(|h| in_degree.get(*h).copied().unwrap_or(0) == 0)
@@ -281,14 +284,23 @@ impl VectorClockDag {
             .collect();
         let mut order = Vec::with_capacity(self.nodes.len());
 
-        while let Some(h) = queue.pop_front() {
+        while !ready.is_empty() {
+            // Pick a ready node whose vector clock causally precedes all other
+            // ready nodes. If none exists (all concurrent), fall back to a
+            // deterministic hash comparison so every honest node picks the same
+            // order.
+            let idx = self
+                .pick_minimal_ready(&ready)
+                .expect("ready set is non-empty");
+            let h = ready.swap_remove(idx);
+
             order.push(h);
             if let Some(node) = self.nodes.get(&h) {
                 for child in &node.children {
                     let deg = in_degree.get_mut(child).expect("child in_degree");
                     *deg -= 1;
                     if *deg == 0 {
-                        queue.push_back(*child);
+                        ready.push(*child);
                     }
                 }
             }
@@ -299,6 +311,36 @@ impl VectorClockDag {
         }
 
         Ok(order)
+    }
+
+    /// From a non-empty set of ready hashes, return the index of a node whose
+    /// vector clock is causally minimal. A node is minimal if no other ready
+    /// node happened-before it. If multiple minimal nodes are concurrent, tie
+    /// break by lexicographic hash order.
+    fn pick_minimal_ready(&self,
+        ready: &[TxHash],
+    ) -> Option<usize> {
+        let mut best_idx = 0usize;
+        let mut best_hash = ready.first()?;
+        let mut best_vc = &self.nodes.get(best_hash)?.shift.vector_clock;
+
+        for (i, h) in ready.iter().enumerate().skip(1) {
+            let vc = &self.nodes.get(h)?.shift.vector_clock;
+            if vc.happened_before(best_vc) {
+                best_idx = i;
+                best_hash = h;
+                best_vc = vc;
+            } else if vc.concurrent_with(best_vc) {
+                // Deterministic tie-break: smaller hash wins.
+                if h < best_hash {
+                    best_idx = i;
+                    best_hash = h;
+                    best_vc = vc;
+                }
+            }
+            // If best_vc happened_before vc, keep best.
+        }
+        Some(best_idx)
     }
 
     /// Apply stateful transactions in topological order, rejecting any that would
@@ -399,6 +441,57 @@ mod tests {
         let balances = dag.apply_ordered().unwrap();
         assert_eq!(balances[&kp.account_id()], 1_000_000_000_000 - 300);
         assert_eq!(balances[&to], 300);
+    }
+
+    #[test]
+    fn topological_order_uses_vector_clock_tiebreaker() {
+        let mut dag = VectorClockDag::new();
+        let kp = KeyPair::generate();
+        let to = KeyPair::generate().account_id();
+        dag.seed_balance(kp.account_id(), 1_000_000_000_000);
+
+        // Two concurrent roots with no predecessor relationship.
+        // shift_a has vector clock {node_a: 1}, shift_b has {node_b: 1, node_a: 1}.
+        // shift_a happened-before shift_b, so it should be ordered first even if
+        // shift_b was inserted first.
+        let mut vc_a = VectorClock::new();
+        vc_a.tick([1u8; 32]);
+        let shift_a = StatefulShift::new(
+            &kp,
+            DEFAULT_DEX_DOMAIN,
+            to,
+            100,
+            vc_a,
+            vec![],
+            1,
+            0,
+        );
+
+        let mut vc_b = VectorClock::new();
+        vc_b.tick([2u8; 32]);
+        vc_b.tick([1u8; 32]);
+        let shift_b = StatefulShift::new(
+            &kp,
+            DEFAULT_DEX_DOMAIN,
+            to,
+            100,
+            vc_b,
+            vec![],
+            2,
+            0,
+        );
+
+        // Insert b first, then a.
+        let hash_a = shift_a.hash();
+        let hash_b = shift_b.hash();
+        dag.insert(shift_b, &kp.public_key(), 0, 3).unwrap();
+        dag.insert(shift_a, &kp.public_key(), 0, 3).unwrap();
+
+        let order = dag.topological_order().unwrap();
+        assert_eq!(order.len(), 2);
+        // a causally precedes b, so a must come first.
+        assert_eq!(order[0], hash_a);
+        assert_eq!(order[1], hash_b);
     }
 
     #[test]
